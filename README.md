@@ -107,6 +107,13 @@ curl -X POST http://127.0.0.1:8787/quotes/batch \
 
 Environment variables are defined in [wrangler.jsonc](wrangler.jsonc). Key settings:
 
+- **L1 (in-memory) TTL**
+	- `L1_TTL_SEC`: Default 20 seconds (applies both during trading and off hours).
+
+- **KV cache TTL policy (soft/hard)**
+	- Trading hours (TW): `SOFT_TTL_TRADING_SEC` = 300 seconds, `HARD_TTL_TRADING_SEC` = 129600 seconds.
+	- Off hours: `SOFT_TTL_OFFHOURS_SEC` = 43200 seconds, `HARD_TTL_OFFHOURS_SEC` = 259200 seconds.
+
 - `DEFAULT_MARKET`: Default market when symbols do not specify one.
 - `MAX_SYMBOLS_PER_REQUEST`: Max symbols per request.
 - `MAX_SYNC_FETCH`: Max cache misses to fetch from Fugle per request.
