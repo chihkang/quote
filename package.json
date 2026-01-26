@@ -9,9 +9,7 @@
 		"test": "vitest run",
 		"test:watch": "vitest --watch"
 	},
-	"dependencies": {
-		"@fugle/marketdata": "^1.4.2"
-	},
+	"dependencies": {},
 	"devDependencies": {
 		"@cloudflare/workers-types": "^4.20250129.0",
 		"miniflare": "^4.20260120.0",
