@@ -1,0 +1,22 @@
+{
+	"name": "quote-worker",
+	"version": "0.0.1",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"dev": "wrangler dev",
+		"deploy": "wrangler deploy",
+		"test": "vitest run",
+		"test:watch": "vitest --watch"
+	},
+	"dependencies": {
+		"@fugle/marketdata": "^1.4.2"
+	},
+	"devDependencies": {
+		"@cloudflare/workers-types": "^4.20250129.0",
+		"miniflare": "^4.20260120.0",
+		"typescript": "^5.6.3",
+		"vitest": "^3.2.4",
+		"wrangler": "^4.60.0"
+	}
+}

@@ -1,0 +1,31 @@
+{
+	"name": "quote-worker",
+	"main": "src/index.ts",
+	"compatibility_date": "2025-03-07",
+	"compatibility_flags": [
+		"nodejs_compat"
+	],
+	"observability": {
+		"enabled": true,
+		"head_sampling_rate": 1
+	},
+	"kv_namespaces": [
+		{
+			"binding": "QUOTES_KV",
+			"id": "e8cbd6fde95a4aee9cf13c381c43458a",
+			"remote": true
+		}
+	],
+	"vars": {
+		"DEFAULT_MARKET": "TW",
+		"MAX_SYNC_FETCH": "10",
+		"MAX_SYMBOLS_PER_REQUEST": "10",
+		"TW_OPEN": "09:00",
+		"TW_CLOSE": "13:30",
+		"SOFT_TTL_TRADING_SEC": "300",
+		"HARD_TTL_TRADING_SEC": "129600",
+		"SOFT_TTL_OFFHOURS_SEC": "43200",
+		"HARD_TTL_OFFHOURS_SEC": "259200",
+		"L1_TTL_SEC": "20"
+	}
+}
