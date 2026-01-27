@@ -59,3 +59,30 @@ export function isTradingSessionTW(now = new Date(), open = '09:00', close = '13
   const parts = getTaipeiParts(now);
   return isTradingSessionTWParts(parts, open, close);
 }
+
+export function secondsUntilNextTwOpen(now = new Date(), open = '09:00'): number {
+  const parts = getTaipeiParts(now);
+  const { hour: openHour, minute: openMinute } = parseTimeHHMM(open);
+
+  const openMinutes = openHour * 60 + openMinute;
+  const nowMinutes = parts.hour * 60 + parts.minute;
+
+  let daysUntilOpen = 0;
+
+  if (parts.weekday >= 1 && parts.weekday <= 5) {
+    if (nowMinutes < openMinutes) {
+      daysUntilOpen = 0;
+    } else if (parts.weekday === 5) {
+      daysUntilOpen = 3;
+    } else {
+      daysUntilOpen = 1;
+    }
+  } else if (parts.weekday === 6) {
+    daysUntilOpen = 2;
+  } else {
+    daysUntilOpen = 1;
+  }
+
+  const minutesUntil = daysUntilOpen * 1440 + (openMinutes - nowMinutes);
+  return Math.max(0, minutesUntil * 60);
+}

@@ -1,11 +1,12 @@
 import { describe, expect, it, vi } from 'vitest';
 
 vi.mock('../src/time', () => ({
-  isTradingSessionTW: vi.fn()
+  isTradingSessionTW: vi.fn(),
+  secondsUntilNextTwOpen: vi.fn()
 }));
 
 import { getTtlSeconds } from '../src/ttl';
-import { isTradingSessionTW } from '../src/time';
+import { isTradingSessionTW, secondsUntilNextTwOpen } from '../src/time';
 
 describe('getTtlSeconds', () => {
   it('uses trading ttl when in TW trading session', () => {
@@ -19,15 +20,16 @@ describe('getTtlSeconds', () => {
     expect(ttl).toEqual({ soft: 120, hard: 600 });
   });
 
-  it('uses offhours ttl when not in trading session', () => {
+  it('uses dynamic offhours hard ttl for TW when not in trading session', () => {
     vi.mocked(isTradingSessionTW).mockReturnValue(false);
+    vi.mocked(secondsUntilNextTwOpen).mockReturnValue(3600);
 
     const ttl = getTtlSeconds('TW', new Date('2026-01-26T02:00:00Z'), {
-      SOFT_TTL_OFFHOURS_SEC: '900',
-      HARD_TTL_OFFHOURS_SEC: '3600'
+      SOFT_TTL_OFFHOURS_SEC: '180',
+      HARD_TTL_OFFHOURS_SEC: '9999'
     });
 
-    expect(ttl).toEqual({ soft: 900, hard: 3600 });
+    expect(ttl).toEqual({ soft: 180, hard: 3900 });
   });
 
   it('uses offhours ttl for US market', () => {
@@ -46,6 +48,6 @@ describe('getTtlSeconds', () => {
 
     const ttl = getTtlSeconds('TW', new Date('2026-01-26T02:00:00Z'), {});
 
-    expect(ttl).toEqual({ soft: 300, hard: 129600 });
+    expect(ttl).toEqual({ soft: 300, hard: 300 });
   });
 });
