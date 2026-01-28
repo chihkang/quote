@@ -111,8 +111,12 @@ Environment variables are defined in [wrangler.jsonc](wrangler.jsonc). Key setti
 	- `L1_TTL_SEC`: Default 20 seconds (applies both during trading and off hours).
 
 - **KV cache TTL policy (soft/hard)**
-	- Trading hours (TW): `SOFT_TTL_TRADING_SEC` = 300 seconds, `HARD_TTL_TRADING_SEC` = 129600 seconds.
-	- Off hours: `SOFT_TTL_OFFHOURS_SEC` = 43200 seconds, `HARD_TTL_OFFHOURS_SEC` = 259200 seconds.
+	- Trading hours (TW): `SOFT_TTL_TRADING_SEC` = 300 seconds, `HARD_TTL_TRADING_SEC` = 300 seconds.
+	- Off hours: `SOFT_TTL_OFFHOURS_SEC` = 300 seconds, `HARD_TTL_OFFHOURS_SEC` = 259200 seconds (US only; TW uses dynamic hard TTL).
+
+- **KV cache retention (how long KV exists)**
+	- Trading hours (TW): KV entries live up to `HARD_TTL_TRADING_SEC` (default 300 seconds). Soft TTL (300 seconds) affects freshness only; a per-entry soft TTL jitter up to 300 seconds is applied.
+	- Off hours (TW): KV entries live until the next TW open time + 5 minutes buffer (dynamic hard TTL). Soft TTL (default 300 seconds) affects freshness only.
 
 - `DEFAULT_MARKET`: Default market when symbols do not specify one.
 - `MAX_SYMBOLS_PER_REQUEST`: Max symbols per request.
