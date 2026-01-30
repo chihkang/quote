@@ -1,115 +1,101 @@
-# Feature Specification: [FEATURE NAME]
+# US Stock Quotes Support
 
-**Feature Branch**: `[###-feature-name]`  
-**Created**: [DATE]  
-**Status**: Draft  
-**Input**: User description: "$ARGUMENTS"
+## Overview
+Extend the existing `POST /quotes/batch` endpoint to support US stock batch queries in addition to TW. The endpoint must keep the current response shape and caching behavior while sourcing US quotes from Finnhub.
 
-## User Scenarios & Testing *(mandatory)*
+## Scope
+- **In scope**: US market symbols in existing batch endpoint, cache integration (L1 + KV), Finnhub quote API integration, documentation updates.
+- **Out of scope**: New endpoints, US trading-hour TTL rules, WebSocket/streaming, authentication beyond API token.
 
-<!--
-  IMPORTANT: User stories should be PRIORITIZED as user journeys ordered by importance.
-  Each user story/journey must be INDEPENDENTLY TESTABLE - meaning if you implement just ONE of them,
-  you should still have a viable MVP (Minimum Viable Product) that delivers value.
-  
-  Assign priorities (P1, P2, P3, etc.) to each story, where P1 is the most critical.
-  Think of each story as a standalone slice of functionality that can be:
-  - Developed independently
-  - Tested independently
-  - Deployed independently
-  - Demonstrated to users independently
--->
+## Inputs
+### Request
+`POST /quotes/batch`
 
-### User Story 1 - [Brief Title] (Priority: P1)
+Body:
+```json
+{
+  "symbols": ["AAPL", "MSFT.US", "US:NVDA"],
+  "market": "US"
+}
+```
 
-[Describe this user journey in plain language]
+Rules:
+- `symbols` is required and must be a non-empty array after trimming entries.
+- `market` is optional. If provided, it overrides per-symbol market hints, consistent with existing behavior.
+- Symbol normalization continues to accept `TICKER`, `TICKER.US`, or `US:TICKER` formats.
 
-**Why this priority**: [Explain the value and why it has this priority level]
+## Behavior
+### Market routing
+- TW symbols continue to use Fugle as before.
+- US symbols use Finnhub quote API.
 
-**Independent Test**: [Describe how this can be tested independently - e.g., "Can be fully tested by [specific action] and delivers [specific value]"]
+### US quote fetch
+For each US symbol, call:
+```
+GET https://finnhub.io/api/v1/quote?symbol={TICKER}&token={FINNHUB_API_KEY}
+```
+- The Finnhub API supports single-symbol requests only; batch requests must issue one call per symbol.
+- Use parallel fetches with a concurrency limit of **5** Finnhub requests per batch.
 
-**Acceptance Scenarios**:
+### Field mapping (Finnhub response)
+Finnhub response example:
+```json
+{
+  "c": 261.74,
+  "h": 263.31,
+  "l": 260.68,
+  "o": 261.07,
+  "pc": 259.45,
+  "t": 1582641000
+}
+```
+Mapping rules:
+- `price` = `c`
+- `currency` = `"USD"`
+- `asOf` = `t` converted from epoch seconds to ISO string
+- `fetchedAt` = time of fetch (ISO)
 
-1. **Given** [initial state], **When** [action], **Then** [expected outcome]
-2. **Given** [initial state], **When** [action], **Then** [expected outcome]
+### Caching
+- Use existing L1 and KV cache logic and TTL policies (reuse current TTL settings).
+- Cache key format remains `quote:US:{TICKER}`.
 
----
+### Error handling
+- If Finnhub returns non-2xx, network error, or invalid JSON, mark the symbol result as `missing` with `reason = "FINNHUB_ERROR"`.
+- If Finnhub returns a response where `c` is missing or not a finite number, treat as missing with `reason = "FINNHUB_ERROR"`.
+- TW flow and error reasons remain unchanged.
 
-### User Story 2 - [Brief Title] (Priority: P2)
+### Response
+Response format remains unchanged; US results must align with existing fields:
+```json
+{
+  "serverTime": "2026-01-30T00:00:00.000Z",
+  "results": [
+    {
+      "symbol": "AAPL",
+      "canonicalSymbol": "AAPL.US",
+      "market": "US",
+      "price": 261.74,
+      "currency": "USD",
+      "asOf": "2020-02-25T14:30:00.000Z",
+      "fetchedAt": "2026-01-30T00:00:00.000Z",
+      "status": "fresh",
+      "isStale": false,
+      "reason": null
+    }
+  ]
+}
+```
 
-[Describe this user journey in plain language]
+## Configuration
+Add a new environment variable:
+- `FINNHUB_API_KEY`: Finnhub API token.
 
-**Why this priority**: [Explain the value and why it has this priority level]
+## Documentation updates
+Update README:
+- Mention US market support.
+- Document `FINNHUB_API_KEY` setup.
+- Add a US curl example.
 
-**Independent Test**: [Describe how this can be tested independently]
-
-**Acceptance Scenarios**:
-
-1. **Given** [initial state], **When** [action], **Then** [expected outcome]
-
----
-
-### User Story 3 - [Brief Title] (Priority: P3)
-
-[Describe this user journey in plain language]
-
-**Why this priority**: [Explain the value and why it has this priority level]
-
-**Independent Test**: [Describe how this can be tested independently]
-
-**Acceptance Scenarios**:
-
-1. **Given** [initial state], **When** [action], **Then** [expected outcome]
-
----
-
-[Add more user stories as needed, each with an assigned priority]
-
-### Edge Cases
-
-<!--
-  ACTION REQUIRED: The content in this section represents placeholders.
-  Fill them out with the right edge cases.
--->
-
-- What happens when [boundary condition]?
-- How does system handle [error scenario]?
-
-## Requirements *(mandatory)*
-
-<!--
-  ACTION REQUIRED: The content in this section represents placeholders.
-  Fill them out with the right functional requirements.
--->
-
-### Functional Requirements
-
-- **FR-001**: System MUST [specific capability, e.g., "allow users to create accounts"]
-- **FR-002**: System MUST [specific capability, e.g., "validate email addresses"]  
-- **FR-003**: Users MUST be able to [key interaction, e.g., "reset their password"]
-- **FR-004**: System MUST [data requirement, e.g., "persist user preferences"]
-- **FR-005**: System MUST [behavior, e.g., "log all security events"]
-
-*Example of marking unclear requirements:*
-
-- **FR-006**: System MUST authenticate users via [NEEDS CLARIFICATION: auth method not specified - email/password, SSO, OAuth?]
-- **FR-007**: System MUST retain user data for [NEEDS CLARIFICATION: retention period not specified]
-
-### Key Entities *(include if feature involves data)*
-
-- **[Entity 1]**: [What it represents, key attributes without implementation]
-- **[Entity 2]**: [What it represents, relationships to other entities]
-
-## Success Criteria *(mandatory)*
-
-<!--
-  ACTION REQUIRED: Define measurable success criteria.
-  These must be technology-agnostic and measurable.
--->
-
-### Measurable Outcomes
-
-- **SC-001**: [Measurable metric, e.g., "Users can complete account creation in under 2 minutes"]
-- **SC-002**: [Measurable metric, e.g., "System handles 1000 concurrent users without degradation"]
-- **SC-003**: [User satisfaction metric, e.g., "90% of users successfully complete primary task on first attempt"]
-- **SC-004**: [Business metric, e.g., "Reduce support tickets related to [X] by 50%"]
+## Testing
+- Add or update unit tests to cover Finnhub response mapping.
+- Add a test for Finnhub error handling resulting in `reason = "FINNHUB_ERROR"`.

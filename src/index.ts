@@ -7,6 +7,7 @@ import { normalizeSymbols, type NormalizedSymbol } from './symbols';
 export type Env = {
 	QUOTES_KV: KVNamespace;
 	FUGLE_API_KEY: string;
+	FINNHUB_API_KEY: string;
 	DEFAULT_MARKET?: string;
 	MAX_SYNC_FETCH?: string;
 	MAX_SYMBOLS_PER_REQUEST?: string;
@@ -70,7 +71,7 @@ function toNumberValue(value: unknown): number | null {
 function toIsoFromEpoch(value: unknown): string | null {
 	const num = toNumberValue(value);
 	if (num === null) return null;
-	const ms = num > 1e14 ? Math.floor(num / 1000) : num > 1e11 ? Math.floor(num / 1000) : num;
+	const ms = num < 1e11 ? num * 1000 : num > 1e14 ? Math.floor(num / 1000) : num;
 	const date = new Date(ms);
 	if (Number.isNaN(date.getTime())) return null;
 	return date.toISOString();
@@ -141,6 +142,32 @@ async function fetchFugleQuote(symbol: string, env: Env) {
 
 	const data = await response.json();
 	return extractQuote(data);
+}
+
+export function mapFinnhubQuote(data: any): { price: number | null; currency: string | null; asOf: string | null } {
+	const price = toNumberValue(data?.c);
+	if (price === null) {
+		return { price: null, currency: null, asOf: null };
+	}
+
+	const asOf = toIsoFromEpoch(data?.t);
+	return {
+		price,
+		currency: 'USD',
+		asOf
+	};
+}
+
+async function fetchFinnhubQuote(symbol: string, env: Env) {
+	const url = `https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(symbol)}&token=${encodeURIComponent(env.FINNHUB_API_KEY)}`;
+	const response = await fetch(url);
+
+	if (!response.ok) {
+		throw new Error(`Finnhub API error: ${response.status}`);
+	}
+
+	const data = await response.json();
+	return mapFinnhubQuote(data);
 }
 
 async function buildFromCache(
@@ -251,11 +278,6 @@ export default {
 		for (let i = 0; i < normalizedList.length; i += 1) {
 			const item = normalizedList[i];
 
-			if (item.market === 'US') {
-				results[i] = await buildMissing(item, 'UNSUPPORTED_MARKET');
-				continue;
-			}
-
 			const l1Hit = l1Get<QuoteResult>(item.kvKey, nowMs);
 			if (l1Hit) {
 				results[i] = l1Hit;
@@ -283,58 +305,120 @@ export default {
 
 		if (missingForFetch.length > 0 && maxSyncFetch > 0) {
 			const fetchTargets = missingForFetch.slice(0, maxSyncFetch);
-			await Promise.all(
-				fetchTargets.map(async ({ index, item }) => {
-					try {
-						const fetchedAt = new Date().toISOString();
-						const { price, currency, asOf } = await fetchFugleQuote(item.ticker, env);
 
-						if (price === null) {
-							console.warn('Fugle quote missing price', { symbol: item.ticker });
-							results[index] = {
-								...results[index],
-								reason: 'FUGLE_ERROR'
-							};
-							return;
-						}
+			const twTargets = fetchTargets.filter(({ item }) => item.market === 'TW');
+			const usTargets = fetchTargets.filter(({ item }) => item.market === 'US');
 
-						const cacheValue: QuoteCacheValue = {
-							symbol: item.ticker,
-							canonicalSymbol: item.canonicalSymbol,
-							market: item.market,
-							price,
-							currency,
-							asOf: asOf ?? fetchedAt,
-							fetchedAt,
-							softTtlJitterSec: jitterSec()
-						};
+			const twPromises = twTargets.map(async ({ index, item }) => {
+				try {
+					const fetchedAt = new Date().toISOString();
+					const { price, currency, asOf } = await fetchFugleQuote(item.ticker, env);
 
-						await putQuote(env, item.kvKey, cacheValue);
-
-						const freshResult: QuoteResult = {
-							symbol: item.originalSymbol,
-							canonicalSymbol: item.canonicalSymbol,
-							market: item.market,
-							price: cacheValue.price,
-							currency: cacheValue.currency,
-							asOf: cacheValue.asOf,
-							fetchedAt: cacheValue.fetchedAt,
-							status: 'fresh',
-							isStale: false,
-							reason: null
-						};
-
-						l1Set(item.kvKey, freshResult, l1TtlSec);
-						results[index] = freshResult;
-					} catch (error) {
-						console.error('Fugle quote failed', { symbol: item.ticker, error });
+					if (price === null) {
+						console.warn('Fugle quote missing price', { symbol: item.ticker });
 						results[index] = {
 							...results[index],
 							reason: 'FUGLE_ERROR'
 						};
+						return;
 					}
-				})
-			);
+
+					const cacheValue: QuoteCacheValue = {
+						symbol: item.ticker,
+						canonicalSymbol: item.canonicalSymbol,
+						market: item.market,
+						price,
+						currency,
+						asOf: asOf ?? fetchedAt,
+						fetchedAt,
+						softTtlJitterSec: jitterSec()
+					};
+
+					await putQuote(env, item.kvKey, cacheValue);
+
+					const freshResult: QuoteResult = {
+						symbol: item.originalSymbol,
+						canonicalSymbol: item.canonicalSymbol,
+						market: item.market,
+						price: cacheValue.price,
+						currency: cacheValue.currency,
+						asOf: cacheValue.asOf,
+						fetchedAt: cacheValue.fetchedAt,
+						status: 'fresh',
+						isStale: false,
+						reason: null
+					};
+
+					l1Set(item.kvKey, freshResult, l1TtlSec);
+					results[index] = freshResult;
+				} catch (error) {
+					console.error('Fugle quote failed', { symbol: item.ticker, error });
+					results[index] = {
+						...results[index],
+						reason: 'FUGLE_ERROR'
+					};
+				}
+			});
+
+			const concurrencyLimit = 5;
+			const twPromise = Promise.all(twPromises);
+			for (let i = 0; i < usTargets.length; i += concurrencyLimit) {
+				const batch = usTargets.slice(i, i + concurrencyLimit);
+				await Promise.all(
+					batch.map(async ({ index, item }) => {
+						try {
+							const fetchedAt = new Date().toISOString();
+							const { price, currency, asOf } = await fetchFinnhubQuote(item.ticker, env);
+
+							if (price === null) {
+								console.warn('Finnhub quote missing price', { symbol: item.ticker });
+								results[index] = {
+									...results[index],
+									reason: 'FINNHUB_ERROR'
+								};
+								return;
+							}
+
+							const cacheValue: QuoteCacheValue = {
+								symbol: item.ticker,
+								canonicalSymbol: item.canonicalSymbol,
+								market: item.market,
+								price,
+								currency,
+								asOf: asOf ?? fetchedAt,
+								fetchedAt,
+								softTtlJitterSec: jitterSec()
+							};
+
+							await putQuote(env, item.kvKey, cacheValue);
+
+							const freshResult: QuoteResult = {
+								symbol: item.originalSymbol,
+								canonicalSymbol: item.canonicalSymbol,
+								market: item.market,
+								price: cacheValue.price,
+								currency: cacheValue.currency,
+								asOf: cacheValue.asOf,
+								fetchedAt: cacheValue.fetchedAt,
+								status: 'fresh',
+								isStale: false,
+								reason: null
+							};
+
+							l1Set(item.kvKey, freshResult, l1TtlSec);
+							results[index] = freshResult;
+						} catch (error) {
+							console.error('Finnhub quote failed', { symbol: item.ticker, error });
+							results[index] = {
+								...results[index],
+								reason: 'FINNHUB_ERROR'
+							};
+						}
+					})
+				);
+			}
+
+			await twPromise;
 		}
 
 		return jsonResponse({

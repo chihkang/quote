@@ -1,13 +1,14 @@
 # Quote Worker
 
-Cloudflare Worker that serves batch TW stock quotes via Fugle with KV-backed caching. The worker returns results immediately with a freshness status (`fresh`, `stale`, or `missing`) and only fetches from Fugle for a limited number of cache misses per request.
+Cloudflare Worker that serves batch TW and US stock quotes via Fugle (TW) and Finnhub (US) with KV-backed caching. The worker returns results immediately with a freshness status (`fresh`, `stale`, or `missing`) and only fetches from external APIs for a limited number of cache misses per request.
 
 ## What the project does
 
-- Provides a single HTTP endpoint to fetch batch quotes.
-- Normalizes symbols (supports input like `2330`, `2330.TW`, or `TW:2330`).
+- Provides a single HTTP endpoint to fetch batch quotes for TW and US markets.
+- Normalizes symbols (supports input like `2330`, `2330.TW`, or `TW:2330` for Taiwan; `AAPL`, `AAPL.US`, or `US:AAPL` for US).
 - Uses two-layer caching: in-memory L1 and Cloudflare KV.
 - Applies soft/hard TTL policies that change during TW trading hours.
+- Fetches TW quotes from Fugle API and US quotes from Finnhub API with a concurrency limit of 5 for US requests.
 
 ## Why the project is useful
 
@@ -21,7 +22,8 @@ Cloudflare Worker that serves batch TW stock quotes via Fugle with KV-backed cac
 
 - Node.js 18+ (recommended).
 - Cloudflare Wrangler CLI (installed via dev dependencies).
-- A Fugle API key.
+- A Fugle API key (for TW market).
+- A Finnhub API key (for US market).
 
 ### Setup
 
@@ -31,10 +33,11 @@ Cloudflare Worker that serves batch TW stock quotes via Fugle with KV-backed cac
 	 npm install
 	 ```
 
-2. Create a `.dev.vars` file with your Fugle API key:
+2. Create a `.dev.vars` file with your API keys:
 
 	 ```bash
-	 FUGLE_API_KEY=your_api_key_here
+	 FUGLE_API_KEY=your_fugle_api_key_here
+	 FINNHUB_API_KEY=your_finnhub_api_key_here
 	 ```
 
 3. Update KV namespace IDs in [wrangler.jsonc](wrangler.jsonc).
@@ -49,12 +52,21 @@ Cloudflare Worker that serves batch TW stock quotes via Fugle with KV-backed cac
 
 `POST /quotes/batch`
 
-Request body:
+Request body (TW example):
 
 ```json
 {
 	"symbols": ["2330", "2317.TW"],
 	"market": "TW"
+}
+```
+
+Request body (US example):
+
+```json
+{
+	"symbols": ["AAPL", "MSFT", "NVDA.US"],
+	"market": "US"
 }
 ```
 
@@ -88,19 +100,29 @@ Response:
 - `canonicalSymbol`: Normalized symbol (`TICKER.TW` or `TICKER.US`).
 - `market`: Market (`TW` or `US`).
 - `price`: Latest price (or `null`).
-- `currency`: Currency (TW defaults to `TWD`).
+- `currency`: Currency (TW defaults to `TWD`, US defaults to `USD`).
 - `asOf`: Quote timestamp from the source (ISO).
 - `fetchedAt`: Cache write time (ISO).
 - `status`: `fresh`, `stale`, or `missing`.
 - `isStale`: Whether the value exceeded the soft TTL.
-- `reason`: One of `KV_MISS`, `HARD_EXPIRED`, `UNSUPPORTED_MARKET`, `FUGLE_ERROR`, or `null`.
+- `reason`: One of `KV_MISS`, `HARD_EXPIRED`, `FUGLE_ERROR`, `FINNHUB_ERROR`, or `null`.
 
 ### Curl example
+
+TW market:
 
 ```bash
 curl -X POST http://127.0.0.1:8787/quotes/batch \
 	-H "Content-Type: application/json" \
 	-d '{"symbols":["2330","2317"],"market":"TW"}'
+```
+
+US market:
+
+```bash
+curl -X POST http://127.0.0.1:8787/quotes/batch \
+	-H "Content-Type: application/json" \
+	-d '{"symbols":["AAPL","MSFT","NVDA"],"market":"US"}'
 ```
 
 ### Configuration
