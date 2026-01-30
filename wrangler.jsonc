@@ -20,7 +20,6 @@
 		"DEFAULT_MARKET": "TW",
 		"MAX_SYNC_FETCH": "10",
 		"MAX_SYMBOLS_PER_REQUEST": "10",
-		"FINNHUB_API_KEY": "",
 		"TW_OPEN": "09:00",
 		"TW_CLOSE": "13:30",
 		"US_OPEN": "10:30",
