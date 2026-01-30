@@ -133,19 +133,23 @@ Environment variables are defined in [wrangler.jsonc](wrangler.jsonc). Key setti
 	- `L1_TTL_SEC`: Default 20 seconds (applies both during trading and off hours).
 
 - **KV cache TTL policy (soft/hard)**
-	- Trading hours (TW): `SOFT_TTL_TRADING_SEC` = 300 seconds, `HARD_TTL_TRADING_SEC` = 300 seconds.
-	- Off hours: `SOFT_TTL_OFFHOURS_SEC` = 300 seconds, `HARD_TTL_OFFHOURS_SEC` = 259200 seconds (US only; TW uses dynamic hard TTL).
+	- Trading hours (TW/US): `SOFT_TTL_TRADING_SEC` and `HARD_TTL_TRADING_SEC` are capped at 300 seconds for US trading hours.
+	- Off hours (TW/US): `SOFT_TTL_OFFHOURS_SEC` affects freshness; hard TTL is computed dynamically until the next market open + 5 minutes.
 
 - **KV cache retention (how long KV exists)**
 	- Trading hours (TW): KV entries live up to `HARD_TTL_TRADING_SEC` (default 300 seconds). Soft TTL (300 seconds) affects freshness only; a per-entry soft TTL jitter up to 300 seconds is applied.
-	- Off hours (TW): KV entries live until the next TW open time + 5 minutes buffer (dynamic hard TTL). Soft TTL (default 300 seconds) affects freshness only.
+	- Trading hours (US): KV entries live up to 5 minutes (hard TTL capped at 300 seconds).
+	- Off hours (TW/US): KV entries live until the next market open time + 5 minutes buffer (dynamic hard TTL). Soft TTL (default 300 seconds) affects freshness only.
 
 - `DEFAULT_MARKET`: Default market when symbols do not specify one.
 - `MAX_SYMBOLS_PER_REQUEST`: Max symbols per request.
 - `MAX_SYNC_FETCH`: Max cache misses to fetch from Fugle per request.
 - `TW_OPEN` / `TW_CLOSE`: TW trading session window (Asia/Taipei).
+- `US_OPEN` / `US_CLOSE`: US trading session window (Asia/Taipei).
+- `US_HOLIDAYS`: Optional comma-separated `YYYY-MM-DD` dates treated as US market holidays (Asia/Taipei calendar date).
 - `SOFT_TTL_TRADING_SEC` / `HARD_TTL_TRADING_SEC`: TTL during trading hours.
-- `SOFT_TTL_OFFHOURS_SEC` / `HARD_TTL_OFFHOURS_SEC`: TTL outside trading hours.
+- `SOFT_TTL_OFFHOURS_SEC`: Soft TTL outside trading hours.
+- `HARD_TTL_OFFHOURS_SEC`: Legacy fallback (not used for TW/US dynamic off-hours TTLs).
 - `L1_TTL_SEC`: In-memory cache TTL (seconds).
 
 ### Tests

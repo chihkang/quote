@@ -23,6 +23,16 @@ export async function getQuote(env: EnvWithKV, key: string): Promise<QuoteCacheV
   }
 }
 
-export async function putQuote(env: EnvWithKV, key: string, value: QuoteCacheValue): Promise<void> {
-  await env.QUOTES_KV.put(key, JSON.stringify(value));
+export async function putQuote(
+  env: EnvWithKV,
+  key: string,
+  value: QuoteCacheValue,
+  expirationTtlSec?: number
+): Promise<void> {
+  const ttl = typeof expirationTtlSec === 'number' && expirationTtlSec > 0 ? expirationTtlSec : undefined;
+  await env.QUOTES_KV.put(
+    key,
+    JSON.stringify(value),
+    ttl ? { expirationTtl: Math.floor(ttl) } : undefined
+  );
 }

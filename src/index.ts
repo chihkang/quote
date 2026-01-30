@@ -13,6 +13,9 @@ export type Env = {
 	MAX_SYMBOLS_PER_REQUEST?: string;
 	TW_OPEN?: string;
 	TW_CLOSE?: string;
+	US_OPEN?: string;
+	US_CLOSE?: string;
+	US_HOLIDAYS?: string;
 	SOFT_TTL_TRADING_SEC?: string;
 	HARD_TTL_TRADING_SEC?: string;
 	SOFT_TTL_OFFHOURS_SEC?: string;
@@ -334,7 +337,8 @@ export default {
 						softTtlJitterSec: jitterSec()
 					};
 
-					await putQuote(env, item.kvKey, cacheValue);
+					const ttl = getTtlSeconds(item.market, new Date(fetchedAt), env);
+					await putQuote(env, item.kvKey, cacheValue, ttl.hard);
 
 					const freshResult: QuoteResult = {
 						symbol: item.originalSymbol,
@@ -390,7 +394,8 @@ export default {
 								softTtlJitterSec: jitterSec()
 							};
 
-							await putQuote(env, item.kvKey, cacheValue);
+							const ttl = getTtlSeconds(item.market, new Date(fetchedAt), env);
+							await putQuote(env, item.kvKey, cacheValue, ttl.hard);
 
 							const freshResult: QuoteResult = {
 								symbol: item.originalSymbol,

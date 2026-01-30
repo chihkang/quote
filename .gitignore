@@ -165,3 +165,10 @@ dist
 .env*
 !.env.example
 .wrangler/
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.log

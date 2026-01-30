@@ -1,0 +1,92 @@
+openapi: 3.0.3
+info:
+  title: Quote Worker API
+  version: 0.0.1
+paths:
+  /quotes/batch:
+    post:
+      summary: Batch quote lookup for TW and US markets
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                symbols:
+                  type: array
+                  items:
+                    type: string
+                market:
+                  type: string
+                  enum: [TW, US]
+              required: [symbols]
+      responses:
+        '200':
+          description: Batch quote results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  serverTime:
+                    type: string
+                    format: date-time
+                  results:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        symbol:
+                          type: string
+                        canonicalSymbol:
+                          type: string
+                        market:
+                          type: string
+                          enum: [TW, US]
+                        price:
+                          type: number
+                          nullable: true
+                        currency:
+                          type: string
+                          nullable: true
+                        asOf:
+                          type: string
+                          format: date-time
+                          nullable: true
+                        fetchedAt:
+                          type: string
+                          format: date-time
+                          nullable: true
+                        status:
+                          type: string
+                          enum: [fresh, stale, missing]
+                        isStale:
+                          type: boolean
+                        reason:
+                          type: string
+                          nullable: true
+                      required:
+                        - symbol
+                        - canonicalSymbol
+                        - market
+                        - price
+                        - currency
+                        - asOf
+                        - fetchedAt
+                        - status
+                        - isStale
+                        - reason
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        '404':
+          description: Not found
+        '405':
+          description: Method not allowed
