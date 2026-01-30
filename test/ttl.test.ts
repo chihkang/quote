@@ -2,11 +2,18 @@ import { describe, expect, it, vi } from 'vitest';
 
 vi.mock('../src/time', () => ({
   isTradingSessionTW: vi.fn(),
-  secondsUntilNextTwOpen: vi.fn()
+  secondsUntilNextTwOpen: vi.fn(),
+  isTradingSessionUS: vi.fn(),
+  secondsUntilNextUsOpen: vi.fn()
 }));
 
 import { getTtlSeconds } from '../src/ttl';
-import { isTradingSessionTW, secondsUntilNextTwOpen } from '../src/time';
+import {
+  isTradingSessionTW,
+  isTradingSessionUS,
+  secondsUntilNextTwOpen,
+  secondsUntilNextUsOpen
+} from '../src/time';
 
 describe('getTtlSeconds', () => {
   it('uses trading ttl when in TW trading session', () => {
@@ -34,13 +41,15 @@ describe('getTtlSeconds', () => {
 
   it('uses offhours ttl for US market', () => {
     vi.mocked(isTradingSessionTW).mockReturnValue(true);
+    vi.mocked(isTradingSessionUS).mockReturnValue(false);
+    vi.mocked(secondsUntilNextUsOpen).mockReturnValue(7200);
 
     const ttl = getTtlSeconds('US', new Date('2026-01-26T02:00:00Z'), {
       SOFT_TTL_OFFHOURS_SEC: '1000',
       HARD_TTL_OFFHOURS_SEC: '2000'
     });
 
-    expect(ttl).toEqual({ soft: 1000, hard: 2000 });
+    expect(ttl).toEqual({ soft: 1000, hard: 7500 });
   });
 
   it('falls back to defaults when env values are missing', () => {
