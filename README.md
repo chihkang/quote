@@ -48,6 +48,17 @@ Cloudflare Worker that serves batch TW and US stock quotes via Fugle (TW) and Fi
 	 npm run dev
 	 ```
 
+#### Deployment secrets (Cloudflare)
+
+For production deployments, you must set API keys as Worker secrets in your Cloudflare environment. Otherwise US quotes will return `FINNHUB_ERROR` and `null` fields.
+
+```bash
+wrangler secret put FUGLE_API_KEY
+wrangler secret put FINNHUB_API_KEY
+```
+
+If you deploy to multiple environments, repeat the secret setup per environment.
+
 ### Usage
 
 `POST /quotes/batch`
