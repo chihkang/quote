@@ -20,6 +20,7 @@ export type Env = {
 	HARD_TTL_TRADING_SEC?: string;
 	SOFT_TTL_OFFHOURS_SEC?: string;
 	HARD_TTL_OFFHOURS_SEC?: string;
+	OFFHOURS_OPEN_BUFFER_SEC?: string;
 	L1_TTL_SEC?: string;
 };
 

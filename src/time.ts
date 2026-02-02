@@ -104,7 +104,11 @@ export function isTradingSessionTW(now = new Date(), open = '09:00', close = '13
   return isTradingSessionTWParts(parts, open, close);
 }
 
-export function secondsUntilNextTwOpen(now = new Date(), open = '09:00'): number {
+export function secondsUntilNextTwOpen(
+  now = new Date(),
+  open = '09:00',
+  bufferSec = 0
+): number {
   const parts = getTaipeiParts(now);
   const { hour: openHour, minute: openMinute } = parseTimeHHMM(open);
 
@@ -128,7 +132,7 @@ export function secondsUntilNextTwOpen(now = new Date(), open = '09:00'): number
   }
 
   const minutesUntil = daysUntilOpen * 1440 + (openMinutes - nowMinutes);
-  return Math.max(0, minutesUntil * 60);
+  return Math.max(0, minutesUntil * 60 + bufferSec);
 }
 
 export function isTradingSessionUS(
@@ -164,7 +168,8 @@ export function isTradingSessionUS(
 export function secondsUntilNextUsOpen(
   now = new Date(),
   open = '10:30',
-  holidays?: string
+  holidays?: string,
+  bufferSec = 0
 ): number {
   const { hour: openHour, minute: openMinute } = parseTimeHHMM(open);
   const openMinutes = openHour * 60 + openMinute;
@@ -184,7 +189,7 @@ export function secondsUntilNextUsOpen(
     }
 
     const minutesUntil = dayOffset * 1440 + (openMinutes - nowMinutes);
-    return Math.max(0, minutesUntil * 60);
+    return Math.max(0, minutesUntil * 60 + bufferSec);
   }
 
   return 0;

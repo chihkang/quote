@@ -20,20 +20,21 @@ export type EnvLike = {
   HARD_TTL_TRADING_SEC?: string;
   SOFT_TTL_OFFHOURS_SEC?: string;
   HARD_TTL_OFFHOURS_SEC?: string;
+  OFFHOURS_OPEN_BUFFER_SEC?: string;
 };
 
 const DEFAULTS = {
   SOFT_TTL_TRADING_SEC: 300,
   HARD_TTL_TRADING_SEC: 300,
   SOFT_TTL_OFFHOURS_SEC: 300,
-  HARD_TTL_OFFHOURS_SEC: 259200
+  HARD_TTL_OFFHOURS_SEC: 259200,
+  OFFHOURS_OPEN_BUFFER_SEC: 180
 };
 
 const TW_OPEN = '09:00';
 const TW_CLOSE = '13:30';
 const US_OPEN = '10:30';
 const US_CLOSE = '05:00';
-const OPEN_BUFFER_SEC = 300;
 
 export function getTtlSeconds(market: 'TW' | 'US', now: Date, env: EnvLike): TTLPair {
   const twOpen = env.TW_OPEN ?? TW_OPEN;
@@ -41,6 +42,10 @@ export function getTtlSeconds(market: 'TW' | 'US', now: Date, env: EnvLike): TTL
   const usOpen = env.US_OPEN ?? US_OPEN;
   const usClose = env.US_CLOSE ?? US_CLOSE;
   const usHolidays = env.US_HOLIDAYS ?? '';
+  const openBufferRaw = Number(env.OFFHOURS_OPEN_BUFFER_SEC ?? DEFAULTS.OFFHOURS_OPEN_BUFFER_SEC);
+  const openBufferSec = Number.isFinite(openBufferRaw)
+    ? Math.max(0, openBufferRaw)
+    : DEFAULTS.OFFHOURS_OPEN_BUFFER_SEC;
 
   const isTwTrading = market === 'TW' && isTradingSessionTW(now, twOpen, twClose);
   const isUsTrading = market === 'US' && isTradingSessionUS(now, usOpen, usClose, usHolidays);
@@ -54,7 +59,7 @@ export function getTtlSeconds(market: 'TW' | 'US', now: Date, env: EnvLike): TTL
 
   if (market === 'TW') {
     const soft = Number(env.SOFT_TTL_OFFHOURS_SEC ?? DEFAULTS.SOFT_TTL_OFFHOURS_SEC);
-    const hard = secondsUntilNextTwOpen(now, twOpen) + OPEN_BUFFER_SEC;
+    const hard = secondsUntilNextTwOpen(now, twOpen, openBufferSec);
     return {
       soft,
       hard: Math.max(hard, soft)
@@ -77,7 +82,7 @@ export function getTtlSeconds(market: 'TW' | 'US', now: Date, env: EnvLike): TTL
   }
 
   const offHoursSoft = Number(env.SOFT_TTL_OFFHOURS_SEC ?? DEFAULTS.SOFT_TTL_OFFHOURS_SEC);
-  const offHoursHard = secondsUntilNextUsOpen(now, usOpen, usHolidays) + OPEN_BUFFER_SEC;
+  const offHoursHard = secondsUntilNextUsOpen(now, usOpen, usHolidays, openBufferSec);
   return {
     soft: offHoursSoft,
     hard: Math.max(offHoursHard, offHoursSoft)

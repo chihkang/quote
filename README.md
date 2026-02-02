@@ -38,6 +38,7 @@ Cloudflare Worker that serves batch TW and US stock quotes via Fugle (TW) and Fi
 	 ```bash
 	 FUGLE_API_KEY=your_fugle_api_key_here
 	 FINNHUB_API_KEY=your_finnhub_api_key_here
+	 OFFHOURS_OPEN_BUFFER_SEC=180
 	 ```
 
 3. Update KV namespace IDs in [wrangler.jsonc](wrangler.jsonc).
@@ -150,7 +151,7 @@ Environment variables are defined in [wrangler.jsonc](wrangler.jsonc). Key setti
 - **KV cache retention (how long KV exists)**
 	- Trading hours (TW): KV entries live up to `HARD_TTL_TRADING_SEC` (default 300 seconds). Soft TTL (300 seconds) affects freshness only; a per-entry soft TTL jitter up to 300 seconds is applied.
 	- Trading hours (US): KV entries live up to 5 minutes (hard TTL capped at 300 seconds).
-	- Off hours (TW/US): KV entries live until the next market open time + 5 minutes buffer (dynamic hard TTL). Soft TTL (default 300 seconds) affects freshness only.
+	- Off hours (TW/US): KV entries live until the next market open time + `OFFHOURS_OPEN_BUFFER_SEC` seconds buffer (default 180) (dynamic hard TTL). Soft TTL (default 300 seconds) affects freshness only.
 
 - `DEFAULT_MARKET`: Default market when symbols do not specify one.
 - `MAX_SYMBOLS_PER_REQUEST`: Max symbols per request.
@@ -161,6 +162,7 @@ Environment variables are defined in [wrangler.jsonc](wrangler.jsonc). Key setti
 - `SOFT_TTL_TRADING_SEC` / `HARD_TTL_TRADING_SEC`: TTL during trading hours.
 - `SOFT_TTL_OFFHOURS_SEC`: Soft TTL outside trading hours.
 - `HARD_TTL_OFFHOURS_SEC`: Legacy fallback (not used for TW/US dynamic off-hours TTLs).
+- `OFFHOURS_OPEN_BUFFER_SEC`: Buffer seconds added to next market open time for off-hours hard TTL.
 - `L1_TTL_SEC`: In-memory cache TTL (seconds).
 
 ### Tests
