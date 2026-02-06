@@ -32,6 +32,8 @@ type QuoteResult = {
 	currency: string | null;
 	asOf: string | null;
 	fetchedAt: string | null;
+	ttlHardSec: number | null;
+	expiresAt: string | null;
 	status: 'fresh' | 'stale' | 'missing';
 	isStale: boolean;
 	reason: string | null;
@@ -194,6 +196,8 @@ async function buildFromCache(
 		currency: cached.currency,
 		asOf: cached.asOf,
 		fetchedAt: cached.fetchedAt,
+		ttlHardSec: cached.ttlHardSec ?? null,
+		expiresAt: cached.expiresAt ?? null,
 		status,
 		isStale: isStale(status),
 		reason: status === 'missing' ? 'HARD_EXPIRED' : null
@@ -212,6 +216,8 @@ async function buildMissing(normalized: NormalizedSymbol, reason: string): Promi
 		currency: null,
 		asOf: null,
 		fetchedAt: null,
+		ttlHardSec: null,
+		expiresAt: null,
 		status: 'missing',
 		isStale: false,
 		reason
@@ -221,6 +227,14 @@ async function buildMissing(normalized: NormalizedSymbol, reason: string): Promi
 function jitterSec(): number {
 	return Math.floor(Math.random() * 301);
 }
+
+function computeExpiresAt(fetchedAt: string, hardTtlSec: number): string {
+	const safeHard = Number.isFinite(hardTtlSec) ? Math.max(0, hardTtlSec) : 0;
+	const parsedStoredAt = Date.parse(fetchedAt);
+	const storedAtMs = Number.isFinite(parsedStoredAt) ? parsedStoredAt : Date.now();
+	return new Date(storedAtMs + safeHard * 1000).toISOString();
+}
+
 
 export default {
 	async fetch(request: Request, env: Env): Promise<Response> {
@@ -327,6 +341,7 @@ export default {
 						return;
 					}
 
+					const ttl = getTtlSeconds(item.market, new Date(fetchedAt), env);
 					const cacheValue: QuoteCacheValue = {
 						symbol: item.ticker,
 						canonicalSymbol: item.canonicalSymbol,
@@ -335,10 +350,11 @@ export default {
 						currency,
 						asOf: asOf ?? fetchedAt,
 						fetchedAt,
+						ttlHardSec: ttl.hard,
+						expiresAt: computeExpiresAt(fetchedAt, ttl.hard),
 						softTtlJitterSec: jitterSec()
 					};
 
-					const ttl = getTtlSeconds(item.market, new Date(fetchedAt), env);
 					await putQuote(env, item.kvKey, cacheValue, ttl.hard);
 
 					const freshResult: QuoteResult = {
@@ -349,6 +365,8 @@ export default {
 						currency: cacheValue.currency,
 						asOf: cacheValue.asOf,
 						fetchedAt: cacheValue.fetchedAt,
+						ttlHardSec: cacheValue.ttlHardSec ?? null,
+						expiresAt: cacheValue.expiresAt ?? null,
 						status: 'fresh',
 						isStale: false,
 						reason: null
@@ -384,6 +402,7 @@ export default {
 								return;
 							}
 
+							const ttl = getTtlSeconds(item.market, new Date(fetchedAt), env);
 							const cacheValue: QuoteCacheValue = {
 								symbol: item.ticker,
 								canonicalSymbol: item.canonicalSymbol,
@@ -392,10 +411,11 @@ export default {
 								currency,
 								asOf: asOf ?? fetchedAt,
 								fetchedAt,
+								ttlHardSec: ttl.hard,
+								expiresAt: computeExpiresAt(fetchedAt, ttl.hard),
 								softTtlJitterSec: jitterSec()
 							};
 
-							const ttl = getTtlSeconds(item.market, new Date(fetchedAt), env);
 							await putQuote(env, item.kvKey, cacheValue, ttl.hard);
 
 							const freshResult: QuoteResult = {
@@ -406,6 +426,8 @@ export default {
 								currency: cacheValue.currency,
 								asOf: cacheValue.asOf,
 								fetchedAt: cacheValue.fetchedAt,
+								ttlHardSec: cacheValue.ttlHardSec ?? null,
+								expiresAt: cacheValue.expiresAt ?? null,
 								status: 'fresh',
 								isStale: false,
 								reason: null

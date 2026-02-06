@@ -6,6 +6,8 @@ export type QuoteCacheValue = {
   currency: string | null;
   asOf: string | null;
   fetchedAt: string;
+  ttlHardSec?: number;
+  expiresAt?: string;
   softTtlJitterSec?: number;
 };
 
@@ -30,9 +32,10 @@ export async function putQuote(
   expirationTtlSec?: number
 ): Promise<void> {
   const ttl = typeof expirationTtlSec === 'number' && expirationTtlSec > 0 ? expirationTtlSec : undefined;
+  const options: KVNamespacePutOptions | undefined = ttl ? { expirationTtl: Math.floor(ttl) } : undefined;
   await env.QUOTES_KV.put(
     key,
     JSON.stringify(value),
-    ttl ? { expirationTtl: Math.floor(ttl) } : undefined
+    options
   );
 }

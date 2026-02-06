@@ -96,6 +96,8 @@ Response:
 			"currency": "TWD",
 			"asOf": "2026-01-26T00:00:00.000Z",
 			"fetchedAt": "2026-01-26T00:00:01.000Z",
+			"ttlHardSec": 300,
+			"expiresAt": "2026-01-26T00:05:01.000Z",
 			"status": "fresh",
 			"isStale": false,
 			"reason": null
@@ -115,6 +117,8 @@ Response:
 - `currency`: Currency (TW defaults to `TWD`, US defaults to `USD`).
 - `asOf`: Quote timestamp from the source (ISO).
 - `fetchedAt`: Cache write time (ISO).
+- `ttlHardSec`: Hard TTL (seconds) stored with the cached value.
+- `expiresAt`: Cache expiry time (ISO) derived from `fetchedAt + ttlHardSec`.
 - `status`: `fresh`, `stale`, or `missing`.
 - `isStale`: Whether the value exceeded the soft TTL.
 - `reason`: One of `KV_MISS`, `HARD_EXPIRED`, `FUGLE_ERROR`, `FINNHUB_ERROR`, or `null`.
@@ -151,18 +155,27 @@ Environment variables are defined in [wrangler.jsonc](wrangler.jsonc). Key setti
 - **KV cache retention (how long KV exists)**
 	- Trading hours (TW): KV entries live up to `HARD_TTL_TRADING_SEC` (default 300 seconds). Soft TTL (300 seconds) affects freshness only; a per-entry soft TTL jitter up to 300 seconds is applied.
 	- Trading hours (US): KV entries live up to 5 minutes (hard TTL capped at 300 seconds).
-	- Off hours (TW/US): KV entries live until the next market open time + `OFFHOURS_OPEN_BUFFER_SEC` seconds buffer (default 180) (dynamic hard TTL). Soft TTL (default 300 seconds) affects freshness only.
+	- Off hours (TW/US): KV entries live until the next market open time + `OFFHOURS_OPEN_BUFFER_SEC` seconds buffer (default 300) (dynamic hard TTL). Soft TTL (default 300 seconds) affects freshness only.
+
+- **KV TTL visibility**
+	- KV values include `ttlHardSec` and `expiresAt`, so you can inspect TTLs directly in the KV UI or API responses.
 
 - `DEFAULT_MARKET`: Default market when symbols do not specify one.
 - `MAX_SYMBOLS_PER_REQUEST`: Max symbols per request.
 - `MAX_SYNC_FETCH`: Max cache misses to fetch from Fugle per request.
 - `TW_OPEN` / `TW_CLOSE`: TW trading session window (Asia/Taipei).
 - `US_OPEN` / `US_CLOSE`: US trading session window (Asia/Taipei).
+	- **Manual DST switch (Asia/Taipei)**:
+	- **Winter (EST)**: `22:30–05:00`
+	- **Summer (EDT)**: `21:30–04:00`
+	- Update `US_OPEN`/`US_CLOSE` in `wrangler.jsonc` (vars) or Cloudflare Dashboard Worker env, then redeploy/apply.
+	- TTL uses `US_OPEN/US_CLOSE` to decide trading vs off-hours. If set incorrectly, off-hours quotes can be treated as trading (TTL capped at 300s).
+	- If you see `expiresAt` only +5 minutes, it usually means `US_OPEN/US_CLOSE` is still set to trading hours.
 - `US_HOLIDAYS`: Optional comma-separated `YYYY-MM-DD` dates treated as US market holidays (Asia/Taipei calendar date).
 - `SOFT_TTL_TRADING_SEC` / `HARD_TTL_TRADING_SEC`: TTL during trading hours.
 - `SOFT_TTL_OFFHOURS_SEC`: Soft TTL outside trading hours.
 - `HARD_TTL_OFFHOURS_SEC`: Legacy fallback (not used for TW/US dynamic off-hours TTLs).
-- `OFFHOURS_OPEN_BUFFER_SEC`: Buffer seconds added to next market open time for off-hours hard TTL.
+- `OFFHOURS_OPEN_BUFFER_SEC`: Buffer seconds added to next market open time for off-hours hard TTL (default 300).
 - `L1_TTL_SEC`: In-memory cache TTL (seconds).
 
 ### Tests

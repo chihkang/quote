@@ -56,6 +56,18 @@ describe('getTtlSeconds', () => {
     expect(secondsUntilNextUsOpen).toHaveBeenCalledWith(expect.any(Date), '10:30', '', 180);
   });
 
+  it('uses default open buffer when env is missing', () => {
+    vi.mocked(isTradingSessionUS).mockReturnValue(false);
+    vi.mocked(secondsUntilNextUsOpen).mockReturnValue(2000);
+
+    const ttl = getTtlSeconds('US', new Date('2026-01-26T02:00:00Z'), {
+      SOFT_TTL_OFFHOURS_SEC: '1000'
+    });
+
+    expect(ttl).toEqual({ soft: 1000, hard: 2000 });
+    expect(secondsUntilNextUsOpen).toHaveBeenCalledWith(expect.any(Date), '10:30', '', 300);
+  });
+
   it('falls back to defaults when env values are missing', () => {
     vi.mocked(isTradingSessionTW).mockReturnValue(true);
 
