@@ -8,29 +8,65 @@ export type TwEodQuote = {
 export type TwEodSnapshot = {
 	tradingDate: string;
 	fetchedAt: string;
-	source: 'TWSE_STOCK_DAY_ALL';
+	source: 'TWSE_STOCK_DAY_ALL' | 'TPEX_STK_QUOTE_RESULT' | 'TPEX_OPENAPI_MAINBOARD_DAILY_CLOSE_QUOTES';
 	quotes: Record<string, TwEodQuote>;
+};
+
+export type RefreshResult = {
+	updated: boolean;
+	tradingDate: string | null;
+	quoteCount: number;
+	deletedCount: number;
 };
 
 export type EnvWithTwEod = {
 	TW_EOD_R2?: R2Bucket;
 	TWSE_EOD_URL?: string;
+	TPEX_EOD_URL?: string;
 	TW_EOD_PATCH_ROWS?: string;
 	TW_EOD_L1_SEC?: string;
 };
 
-export const TW_EOD_LATEST_KEY = 'twse/eod/latest.json';
-
-const DEFAULT_CSV_URL = 'https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL?response=open_data';
-const DEFAULT_PATCH_ROWS = 239;
-const DEFAULT_L1_SEC = 60;
+type Board = 'TWSE' | 'TPEX';
 
 type L1SnapshotCache = {
 	expiresAtMs: number;
 	snapshot: TwEodSnapshot;
 };
 
-let snapshotCache: L1SnapshotCache | null = null;
+type TpexPayload = {
+	date?: string;
+	tables?: Array<{
+		title?: string;
+		date?: string;
+		fields?: string[];
+		data?: unknown[][];
+	}>;
+};
+
+type TpexOpenApiRow = {
+	Date?: string;
+	SecuritiesCompanyCode?: string;
+	CompanyName?: string;
+	Close?: string;
+};
+
+export const TWSE_EOD_LATEST_KEY = 'twse/eod/latest.json';
+export const TPEX_EOD_LATEST_KEY = 'tpex/eod/latest.json';
+export const TW_EOD_LATEST_KEY = TWSE_EOD_LATEST_KEY;
+
+const DEFAULT_TWSE_CSV_URL = 'https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL?response=open_data';
+const DEFAULT_TPEX_JSON_URL =
+	'https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes';
+const LEGACY_TPEX_JSON_URL =
+	'https://www.tpex.org.tw/web/stock/aftertrading/DAILY_CLOSE_quotes/stk_quote_result.php?l=zh-tw&o=json';
+const DEFAULT_PATCH_ROWS = 239;
+const DEFAULT_L1_SEC = 60;
+
+const caches: Record<Board, L1SnapshotCache | null> = {
+	TWSE: null,
+	TPEX: null
+};
 
 function toPositiveInt(raw: string | undefined, fallback: number): number {
 	const value = Number(raw);
@@ -40,6 +76,15 @@ function toPositiveInt(raw: string | undefined, fallback: number): number {
 
 function normalizeHeader(value: string): string {
 	return value.replace(/^\uFEFF/, '').trim();
+}
+
+function toErrorMessage(error: unknown): string {
+	if (error instanceof Error && error.message) return error.message;
+	return String(error);
+}
+
+function getL1TtlSec(env: EnvWithTwEod): number {
+	return toPositiveInt(env.TW_EOD_L1_SEC, DEFAULT_L1_SEC);
 }
 
 function parseRows(csv: string): string[][] {
@@ -91,22 +136,22 @@ function parseRows(csv: string): string[][] {
 }
 
 function parseTradingDate(raw: string): string | null {
-	const cleaned = raw.trim();
-	if (!cleaned) return null;
+	const digits = raw.trim().replace(/[^\d]/g, '');
+	if (!digits) return null;
 
-	if (/^\d{8}$/.test(cleaned)) {
-		const year = Number(cleaned.slice(0, 4));
-		const month = Number(cleaned.slice(4, 6));
-		const day = Number(cleaned.slice(6, 8));
+	if (digits.length === 8) {
+		const year = Number(digits.slice(0, 4));
+		const month = Number(digits.slice(4, 6));
+		const day = Number(digits.slice(6, 8));
 		if (year > 1900 && month >= 1 && month <= 12 && day >= 1 && day <= 31) {
 			return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
 		}
 	}
 
-	if (/^\d{7}$/.test(cleaned)) {
-		const rocYear = Number(cleaned.slice(0, 3));
-		const month = Number(cleaned.slice(3, 5));
-		const day = Number(cleaned.slice(5, 7));
+	if (digits.length === 7) {
+		const rocYear = Number(digits.slice(0, 3));
+		const month = Number(digits.slice(3, 5));
+		const day = Number(digits.slice(5, 7));
 		if (rocYear > 0 && month >= 1 && month <= 12 && day >= 1 && day <= 31) {
 			const year = rocYear + 1911;
 			return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
@@ -118,9 +163,180 @@ function parseTradingDate(raw: string): string | null {
 
 function parseClosePrice(raw: string): number | null {
 	const cleaned = raw.trim().replace(/,/g, '');
-	if (!cleaned || cleaned === '--') return null;
+	if (!cleaned || cleaned === '--' || cleaned === '---') return null;
 	const value = Number(cleaned);
 	return Number.isFinite(value) ? value : null;
+}
+
+function parseSnapshot(raw: unknown): TwEodSnapshot | null {
+	if (!raw || typeof raw !== 'object') return null;
+	const data = raw as Partial<TwEodSnapshot>;
+	if (typeof data.tradingDate !== 'string' || typeof data.fetchedAt !== 'string') return null;
+	if (typeof data.source !== 'string' || data.source.length === 0) return null;
+	if (!data.quotes || typeof data.quotes !== 'object') return null;
+	return data as TwEodSnapshot;
+}
+
+function getDateKey(board: Board, tradingDate: string): string {
+	return `${board.toLowerCase()}/eod/${tradingDate}.json`;
+}
+
+function getLatestKey(board: Board): string {
+	return board === 'TWSE' ? TWSE_EOD_LATEST_KEY : TPEX_EOD_LATEST_KEY;
+}
+
+async function readLatestSnapshot(env: EnvWithTwEod, board: Board): Promise<TwEodSnapshot | null> {
+	if (!env.TW_EOD_R2) return null;
+	const object = await env.TW_EOD_R2.get(getLatestKey(board));
+	if (!object) return null;
+	return parseSnapshot(await object.json());
+}
+
+function getTpexFetchUrls(env: EnvWithTwEod): string[] {
+	const configured = env.TPEX_EOD_URL?.trim() ?? '';
+	const urls = [configured, DEFAULT_TPEX_JSON_URL, LEGACY_TPEX_JSON_URL].filter((item) => item.length > 0);
+	return [...new Set(urls)];
+}
+
+function isRedirect(status: number): boolean {
+	return status >= 300 && status < 400;
+}
+
+async function fetchJsonFromUrl(url: string): Promise<unknown> {
+	const response = await fetch(url, {
+		redirect: 'manual',
+		headers: {
+			accept: 'application/json,text/plain,*/*',
+			'accept-language': 'zh-TW,zh;q=0.9,en;q=0.8',
+			referer: 'https://www.tpex.org.tw/'
+		}
+	});
+
+	if (isRedirect(response.status)) {
+		const location = response.headers.get('location') ?? 'unknown';
+		throw new Error(`redirected (${response.status}) to ${location}`);
+	}
+
+	if (!response.ok) {
+		throw new Error(`status ${response.status}`);
+	}
+
+	const contentType = (response.headers.get('content-type') ?? '').toLowerCase();
+	if (contentType.includes('text/html')) {
+		throw new Error(`unexpected content-type ${contentType}`);
+	}
+
+	const raw = await response.text();
+	try {
+		return JSON.parse(raw) as unknown;
+	} catch {
+		throw new Error('response is not valid JSON');
+	}
+}
+
+async function getLatestSnapshot(
+	env: EnvWithTwEod,
+	board: Board,
+	nowMs = Date.now()
+): Promise<TwEodSnapshot | null> {
+	if (!env.TW_EOD_R2) return null;
+
+	const cached = caches[board];
+	if (cached && nowMs < cached.expiresAtMs) {
+		return cached.snapshot;
+	}
+
+	const snapshot = await readLatestSnapshot(env, board);
+	if (!snapshot) {
+		caches[board] = null;
+		return null;
+	}
+
+	caches[board] = {
+		snapshot,
+		expiresAtMs: nowMs + getL1TtlSec(env) * 1000
+	};
+	return snapshot;
+}
+
+async function cleanupStaleSnapshots(env: EnvWithTwEod, board: Board, keepTradingDate: string): Promise<number> {
+	if (!env.TW_EOD_R2) return 0;
+
+	const keep = new Set<string>([getLatestKey(board), getDateKey(board, keepTradingDate)]);
+	const prefix = `${board.toLowerCase()}/eod/`;
+	const staleKeys: string[] = [];
+	let cursor: string | undefined;
+
+	do {
+		const listed = await env.TW_EOD_R2.list({
+			prefix,
+			cursor
+		});
+
+		for (const object of listed.objects) {
+			const key = object.key;
+			if (keep.has(key)) continue;
+
+			const suffix = key.slice(prefix.length);
+			if (!/^\d{4}-\d{2}-\d{2}\.json$/.test(suffix)) continue;
+			staleKeys.push(key);
+		}
+
+		cursor = listed.truncated ? listed.cursor : undefined;
+	} while (cursor);
+
+	if (staleKeys.length === 0) return 0;
+	await env.TW_EOD_R2.delete(staleKeys);
+	return staleKeys.length;
+}
+
+async function persistSnapshot(
+	env: EnvWithTwEod,
+	board: Board,
+	snapshot: TwEodSnapshot,
+	now = new Date()
+): Promise<RefreshResult> {
+	if (!env.TW_EOD_R2) {
+		return { updated: false, tradingDate: null, quoteCount: 0, deletedCount: 0 };
+	}
+
+	const latest = await readLatestSnapshot(env, board);
+	if (latest && latest.tradingDate === snapshot.tradingDate) {
+		const deletedCount = await cleanupStaleSnapshots(env, board, latest.tradingDate);
+		caches[board] = {
+			snapshot: latest,
+			expiresAtMs: now.getTime() + getL1TtlSec(env) * 1000
+		};
+		return {
+			updated: false,
+			tradingDate: latest.tradingDate,
+			quoteCount: Object.keys(latest.quotes).length,
+			deletedCount
+		};
+	}
+
+	const body = JSON.stringify(snapshot);
+	await Promise.all([
+		env.TW_EOD_R2.put(getLatestKey(board), body, {
+			httpMetadata: { contentType: 'application/json' }
+		}),
+		env.TW_EOD_R2.put(getDateKey(board, snapshot.tradingDate), body, {
+			httpMetadata: { contentType: 'application/json' }
+		})
+	]);
+
+	const deletedCount = await cleanupStaleSnapshots(env, board, snapshot.tradingDate);
+	caches[board] = {
+		snapshot,
+		expiresAtMs: now.getTime() + getL1TtlSec(env) * 1000
+	};
+
+	return {
+		updated: true,
+		tradingDate: snapshot.tradingDate,
+		quoteCount: Object.keys(snapshot.quotes).length,
+		deletedCount
+	};
 }
 
 export function parseTwseStockDayAllCsv(
@@ -153,7 +369,7 @@ export function parseTwseStockDayAllCsv(
 		if (!rawSymbol) continue;
 
 		if (!tradingDate) {
-			tradingDate = parseTradingDate((row[dateIndex] ?? '').trim());
+			tradingDate = parseTradingDate(row[dateIndex] ?? '');
 		}
 
 		let symbol = rawSymbol;
@@ -179,56 +395,111 @@ export function parseTwseStockDayAllCsv(
 	};
 }
 
-function parseSnapshot(raw: unknown): TwEodSnapshot | null {
-	if (!raw || typeof raw !== 'object') return null;
-	const data = raw as Partial<TwEodSnapshot>;
-	if (typeof data.tradingDate !== 'string' || typeof data.fetchedAt !== 'string') return null;
-	if (data.source !== 'TWSE_STOCK_DAY_ALL') return null;
-	if (!data.quotes || typeof data.quotes !== 'object') return null;
-	return data as TwEodSnapshot;
+function parseTpexLegacyPayload(payload: TpexPayload, fetchedAt: string): TwEodSnapshot {
+	const table = (payload.tables ?? []).find((item) => (item.title ?? '').includes('上櫃股票行情'));
+	if (!table) {
+		throw new Error('TPEX JSON missing target table');
+	}
+
+	const fields = (table.fields ?? []).map((field) => field.trim());
+	const symbolIndex = fields.indexOf('代號');
+	const nameIndex = fields.indexOf('名稱');
+	const closeIndex = fields.indexOf('收盤');
+
+	if (symbolIndex < 0 || nameIndex < 0 || closeIndex < 0) {
+		throw new Error('TPEX JSON missing required fields');
+	}
+
+	const quotes: Record<string, TwEodQuote> = {};
+	for (const row of table.data ?? []) {
+		const rawSymbol = String(row[symbolIndex] ?? '').trim().toUpperCase();
+		if (!rawSymbol) continue;
+
+		const close = parseClosePrice(String(row[closeIndex] ?? ''));
+		const name = String(row[nameIndex] ?? '').trim() || null;
+		quotes[rawSymbol] = { close, name };
+	}
+
+	const tradingDate =
+		parseTradingDate(payload.date ?? '') ??
+		parseTradingDate(table.date ?? '') ??
+		getTaipeiDateISO(new Date(fetchedAt));
+
+	return {
+		tradingDate,
+		fetchedAt,
+		source: 'TPEX_STK_QUOTE_RESULT',
+		quotes
+	};
 }
 
-async function readLatestFromR2(env: EnvWithTwEod): Promise<TwEodSnapshot | null> {
-	if (!env.TW_EOD_R2) return null;
-	const object = await env.TW_EOD_R2.get(TW_EOD_LATEST_KEY);
-	if (!object) return null;
-	const parsed = parseSnapshot(await object.json());
-	return parsed;
+function parseTpexOpenApiPayload(rows: TpexOpenApiRow[], fetchedAt: string): TwEodSnapshot {
+	if (rows.length === 0) {
+		throw new Error('TPEX OpenAPI returned empty rows');
+	}
+
+	const quotes: Record<string, TwEodQuote> = {};
+	let tradingDate: string | null = null;
+	for (const row of rows) {
+		const rawSymbol = String(row.SecuritiesCompanyCode ?? '').trim().toUpperCase();
+		if (!rawSymbol) continue;
+
+		if (!tradingDate) {
+			tradingDate = parseTradingDate(String(row.Date ?? ''));
+		}
+
+		const close = parseClosePrice(String(row.Close ?? ''));
+		const name = String(row.CompanyName ?? '').trim() || null;
+		quotes[rawSymbol] = { close, name };
+	}
+
+	if (!tradingDate) {
+		tradingDate = getTaipeiDateISO(new Date(fetchedAt));
+	}
+
+	return {
+		tradingDate,
+		fetchedAt,
+		source: 'TPEX_OPENAPI_MAINBOARD_DAILY_CLOSE_QUOTES',
+		quotes
+	};
 }
 
-function getL1TtlSec(env: EnvWithTwEod): number {
-	return toPositiveInt(env.TW_EOD_L1_SEC, DEFAULT_L1_SEC);
+export function parseTpexDailyCloseJson(payload: unknown, fetchedAt = new Date().toISOString()): TwEodSnapshot {
+	if (Array.isArray(payload)) {
+		return parseTpexOpenApiPayload(payload as TpexOpenApiRow[], fetchedAt);
+	}
+	if (payload && typeof payload === 'object') {
+		return parseTpexLegacyPayload(payload as TpexPayload, fetchedAt);
+	}
+	throw new Error('TPEX JSON payload type is invalid');
 }
 
 export function clearTwEodL1Cache(): void {
-	snapshotCache = null;
-}
-
-export async function getLatestTwEodSnapshot(
-	env: EnvWithTwEod,
-	nowMs = Date.now()
-): Promise<TwEodSnapshot | null> {
-	if (!env.TW_EOD_R2) return null;
-
-	if (snapshotCache && nowMs < snapshotCache.expiresAtMs) {
-		return snapshotCache.snapshot;
-	}
-
-	const snapshot = await readLatestFromR2(env);
-	if (!snapshot) {
-		snapshotCache = null;
-		return null;
-	}
-
-	snapshotCache = {
-		snapshot,
-		expiresAtMs: nowMs + getL1TtlSec(env) * 1000
-	};
-	return snapshot;
+	caches.TWSE = null;
+	caches.TPEX = null;
 }
 
 export function getTwEodDateKey(tradingDate: string): string {
-	return `twse/eod/${tradingDate}.json`;
+	return getDateKey('TWSE', tradingDate);
+}
+
+export function getTpexEodDateKey(tradingDate: string): string {
+	return getDateKey('TPEX', tradingDate);
+}
+
+export async function getLatestTwseEodSnapshot(
+	env: EnvWithTwEod,
+	nowMs = Date.now()
+): Promise<TwEodSnapshot | null> {
+	return getLatestSnapshot(env, 'TWSE', nowMs);
+}
+
+export async function getLatestTpexEodSnapshot(
+	env: EnvWithTwEod,
+	nowMs = Date.now()
+): Promise<TwEodSnapshot | null> {
+	return getLatestSnapshot(env, 'TPEX', nowMs);
 }
 
 export function getTwEodQuote(snapshot: TwEodSnapshot | null, ticker: string): TwEodQuote | null {
@@ -252,18 +523,14 @@ export function getTwEodQuote(snapshot: TwEodSnapshot | null, ticker: string): T
 	return null;
 }
 
-export async function refreshTwEodSnapshot(
-	env: EnvWithTwEod,
-	now = new Date()
-): Promise<{ updated: boolean; tradingDate: string | null; quoteCount: number; deletedCount: number }> {
+export async function refreshTwseEodSnapshot(env: EnvWithTwEod, now = new Date()): Promise<RefreshResult> {
 	if (!env.TW_EOD_R2) {
 		return { updated: false, tradingDate: null, quoteCount: 0, deletedCount: 0 };
 	}
 
-	const url = env.TWSE_EOD_URL ?? DEFAULT_CSV_URL;
-	const patchRows = toPositiveInt(env.TW_EOD_PATCH_ROWS, DEFAULT_PATCH_ROWS);
 	const fetchedAt = now.toISOString();
-
+	const url = env.TWSE_EOD_URL ?? DEFAULT_TWSE_CSV_URL;
+	const patchRows = toPositiveInt(env.TW_EOD_PATCH_ROWS, DEFAULT_PATCH_ROWS);
 	const response = await fetch(url);
 	if (!response.ok) {
 		throw new Error(`TWSE EOD fetch failed: ${response.status}`);
@@ -271,41 +538,41 @@ export async function refreshTwEodSnapshot(
 
 	const csv = await response.text();
 	const snapshot = parseTwseStockDayAllCsv(csv, patchRows, fetchedAt);
-	const latest = await readLatestFromR2(env);
-	const cleanupStaleSnapshots = async (keepTradingDate: string): Promise<number> => {
-		const keep = new Set<string>([TW_EOD_LATEST_KEY, getTwEodDateKey(keepTradingDate)]);
-		const staleKeys: string[] = [];
-		let cursor: string | undefined;
+	return persistSnapshot(env, 'TWSE', snapshot, now);
+}
 
-		do {
-			const listed = await env.TW_EOD_R2!.list({
-				prefix: 'twse/eod/',
-				cursor
-			});
+export async function refreshTpexEodSnapshot(env: EnvWithTwEod, now = new Date()): Promise<RefreshResult> {
+	if (!env.TW_EOD_R2) {
+		return { updated: false, tradingDate: null, quoteCount: 0, deletedCount: 0 };
+	}
 
-			for (const object of listed.objects) {
-				const key = object.key;
-				if (keep.has(key)) continue;
+	const fetchedAt = now.toISOString();
+	const urls = getTpexFetchUrls(env);
+	const errors: string[] = [];
 
-				const suffix = key.slice('twse/eod/'.length);
-				if (!/^\d{4}-\d{2}-\d{2}\.json$/.test(suffix)) continue;
-				staleKeys.push(key);
-			}
+	for (const url of urls) {
+		try {
+			const payload = await fetchJsonFromUrl(url);
+			const snapshot = parseTpexDailyCloseJson(payload, fetchedAt);
+			return persistSnapshot(env, 'TPEX', snapshot, now);
+		} catch (error) {
+			errors.push(`${url} -> ${toErrorMessage(error)}`);
+		}
+	}
 
-			cursor = listed.truncated ? listed.cursor : undefined;
-		} while (cursor);
-
-		if (staleKeys.length === 0) return 0;
-		await env.TW_EOD_R2!.delete(staleKeys);
-		return staleKeys.length;
-	};
-
-	if (latest && latest.tradingDate === snapshot.tradingDate) {
-		const deletedCount = await cleanupStaleSnapshots(latest.tradingDate);
-		snapshotCache = {
+	const latest = await readLatestSnapshot(env, 'TPEX');
+	if (latest) {
+		const deletedCount = await cleanupStaleSnapshots(env, 'TPEX', latest.tradingDate);
+		caches.TPEX = {
 			snapshot: latest,
 			expiresAtMs: now.getTime() + getL1TtlSec(env) * 1000
 		};
+
+		console.warn('TPEX EOD refresh failed, serving cached snapshot', {
+			tradingDate: latest.tradingDate,
+			errors
+		});
+
 		return {
 			updated: false,
 			tradingDate: latest.tradingDate,
@@ -314,26 +581,5 @@ export async function refreshTwEodSnapshot(
 		};
 	}
 
-	const body = JSON.stringify(snapshot);
-	await Promise.all([
-		env.TW_EOD_R2.put(TW_EOD_LATEST_KEY, body, {
-			httpMetadata: { contentType: 'application/json' }
-		}),
-		env.TW_EOD_R2.put(getTwEodDateKey(snapshot.tradingDate), body, {
-			httpMetadata: { contentType: 'application/json' }
-		})
-	]);
-	const deletedCount = await cleanupStaleSnapshots(snapshot.tradingDate);
-
-	snapshotCache = {
-		snapshot,
-		expiresAtMs: now.getTime() + getL1TtlSec(env) * 1000
-	};
-
-	return {
-		updated: true,
-		tradingDate: snapshot.tradingDate,
-		quoteCount: Object.keys(snapshot.quotes).length,
-		deletedCount
-	};
+	throw new Error(`TPEX EOD fetch failed: ${errors.join(' | ')}`);
 }

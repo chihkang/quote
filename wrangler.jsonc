@@ -44,6 +44,7 @@
 		"OFFHOURS_OPEN_BUFFER_SEC": "300",
 		"L1_TTL_SEC": "20",
 		"TWSE_EOD_URL": "https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL?response=open_data",
+		"TPEX_EOD_URL": "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes",
 		"TW_EOD_PATCH_ROWS": "239",
 		"TW_429_BLOCK_SEC": "60",
 		"TW_EOD_L1_SEC": "60"

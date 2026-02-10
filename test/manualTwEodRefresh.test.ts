@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import worker from '../src/index';
-import { clearTwEodL1Cache, TW_EOD_LATEST_KEY } from '../src/twEod';
+import { clearTwEodL1Cache, TPEX_EOD_LATEST_KEY, TWSE_EOD_LATEST_KEY } from '../src/twEod';
 
 function createKv() {
 	return {
@@ -66,11 +66,26 @@ async function callManualRefresh(
 	return worker.fetch(request, env);
 }
 
-const CSV = ['日期,證券代號,證券名稱,收盤價', '1150210,50,元大台灣50,75.50', '1150210,2330,台積電,1080'].join(
+const TWSE_CSV = ['日期,證券代號,證券名稱,收盤價', '1150210,50,元大台灣50,75.50', '1150210,2330,台積電,1080'].join(
 	'\n'
 );
 
-describe('manual TWSE EOD refresh endpoint', () => {
+const TPEX_OPENAPI_JSON = [
+	{
+		Date: '1150210',
+		SecuritiesCompanyCode: '006201',
+		CompanyName: '元大富櫃50',
+		Close: '29.08'
+	},
+	{
+		Date: '1150210',
+		SecuritiesCompanyCode: '8069',
+		CompanyName: '元太',
+		Close: '185.00'
+	}
+];
+
+describe('manual TWSE/TPEX EOD refresh endpoint', () => {
 	beforeEach(() => {
 		clearTwEodL1Cache();
 	});
@@ -94,17 +109,35 @@ describe('manual TWSE EOD refresh endpoint', () => {
 		expect(response.status).toBe(401);
 	});
 
-	it('refreshes snapshot, removes stale dated files, and is idempotent for same trading date', async () => {
+	it('refreshes both sources, cleans stale files, and is idempotent on same trading date', async () => {
 		const r2 = createR2({
 			'twse/eod/2026-02-09.json': JSON.stringify({
 				tradingDate: '2026-02-09',
 				fetchedAt: '2026-02-09T06:00:00.000Z',
 				source: 'TWSE_STOCK_DAY_ALL',
 				quotes: {}
+			}),
+			'tpex/eod/2026-02-09.json': JSON.stringify({
+				tradingDate: '2026-02-09',
+				fetchedAt: '2026-02-09T06:00:00.000Z',
+				source: 'TPEX_STK_QUOTE_RESULT',
+				quotes: {}
 			})
 		});
 		const env = buildEnv(r2, { ADMIN_REFRESH_TOKEN: 'secret-token' });
-		const fetchMock = vi.fn(async () => new Response(CSV, { status: 200 }));
+		const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+			const url = String(input);
+			if (url.includes('twse.com.tw')) {
+				return new Response(TWSE_CSV, { status: 200 });
+			}
+			if (url.includes('tpex.org.tw')) {
+				return new Response(JSON.stringify(TPEX_OPENAPI_JSON), {
+					status: 200,
+					headers: { 'Content-Type': 'application/json' }
+				});
+			}
+			return new Response('not found', { status: 404 });
+		});
 		vi.stubGlobal('fetch', fetchMock);
 
 		const first = await callManualRefresh(env, { 'x-admin-token': 'secret-token' });
@@ -112,13 +145,17 @@ describe('manual TWSE EOD refresh endpoint', () => {
 
 		expect(first.status).toBe(200);
 		expect(firstJson.ok).toBe(true);
-		expect(firstJson.updated).toBe(true);
-		expect(firstJson.tradingDate).toBe('2026-02-10');
-		expect(firstJson.quoteCount).toBe(2);
-		expect(firstJson.deletedCount).toBe(1);
-		expect(r2.objects.has(TW_EOD_LATEST_KEY)).toBe(true);
-		expect(r2.objects.has('twse/eod/2026-02-10.json')).toBe(true);
+		expect(firstJson.partial).toBe(false);
+		expect(firstJson.twse.updated).toBe(true);
+		expect(firstJson.twse.tradingDate).toBe('2026-02-10');
+		expect(firstJson.twse.deletedCount).toBe(1);
+		expect(firstJson.tpex.updated).toBe(true);
+		expect(firstJson.tpex.tradingDate).toBe('2026-02-10');
+		expect(firstJson.tpex.deletedCount).toBe(1);
+		expect(r2.objects.has(TWSE_EOD_LATEST_KEY)).toBe(true);
+		expect(r2.objects.has(TPEX_EOD_LATEST_KEY)).toBe(true);
 		expect(r2.objects.has('twse/eod/2026-02-09.json')).toBe(false);
+		expect(r2.objects.has('tpex/eod/2026-02-09.json')).toBe(false);
 
 		const second = await callManualRefresh(env, {
 			authorization: 'Bearer secret-token'
@@ -126,9 +163,135 @@ describe('manual TWSE EOD refresh endpoint', () => {
 		const secondJson = (await second.json()) as any;
 
 		expect(second.status).toBe(200);
-		expect(secondJson.updated).toBe(false);
-		expect(secondJson.tradingDate).toBe('2026-02-10');
-		expect(secondJson.deletedCount).toBe(0);
-		expect(fetchMock).toHaveBeenCalledTimes(2);
+		expect(secondJson.ok).toBe(true);
+		expect(secondJson.partial).toBe(false);
+		expect(secondJson.twse.updated).toBe(false);
+		expect(secondJson.tpex.updated).toBe(false);
+		expect(fetchMock).toHaveBeenCalledTimes(4);
+	});
+
+	it('returns partial success when only one source refreshes', async () => {
+		const env = buildEnv(createR2(), { ADMIN_REFRESH_TOKEN: 'secret-token' });
+		const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+			const url = String(input);
+			if (url.includes('twse.com.tw')) {
+				return new Response(TWSE_CSV, { status: 200 });
+			}
+			if (url.includes('tpex.org.tw')) {
+				return new Response('upstream error', { status: 500 });
+			}
+			return new Response('not found', { status: 404 });
+		});
+		vi.stubGlobal('fetch', fetchMock);
+
+		const response = await callManualRefresh(env, { 'x-admin-token': 'secret-token' });
+		const json = (await response.json()) as any;
+
+		expect(response.status).toBe(200);
+		expect(json.ok).toBe(true);
+		expect(json.partial).toBe(true);
+		expect(json.twse.error).toBeUndefined();
+		expect(json.tpex.error).toMatch('TPEX EOD fetch failed');
+	});
+
+	it('uses cached TPEX snapshot when upstream redirects to error pages', async () => {
+		const r2 = createR2({
+			[TPEX_EOD_LATEST_KEY]: JSON.stringify({
+				tradingDate: '2026-02-10',
+				fetchedAt: '2026-02-10T08:40:32.907Z',
+				source: 'TPEX_OPENAPI_MAINBOARD_DAILY_CLOSE_QUOTES',
+				quotes: {
+					'006201': { close: 29.08, name: '元大富櫃50' }
+				}
+			})
+		});
+		const env = buildEnv(r2, { ADMIN_REFRESH_TOKEN: 'secret-token' });
+		const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+			const url = String(input);
+			if (url.includes('twse.com.tw')) {
+				return new Response(TWSE_CSV, { status: 200 });
+			}
+			if (url.includes('tpex.org.tw')) {
+				return new Response(null, {
+					status: 302,
+					headers: { Location: 'https://www.tpex.org.tw/errors' }
+				});
+			}
+			return new Response('not found', { status: 404 });
+		});
+		vi.stubGlobal('fetch', fetchMock);
+
+		const response = await callManualRefresh(env, { 'x-admin-token': 'secret-token' });
+		const json = (await response.json()) as any;
+
+		expect(response.status).toBe(200);
+		expect(json.ok).toBe(true);
+		expect(json.partial).toBe(false);
+		expect(json.tpex.error).toBeUndefined();
+		expect(json.tpex.updated).toBe(false);
+		expect(json.tpex.tradingDate).toBe('2026-02-10');
+		expect(json.tpex.quoteCount).toBe(1);
+	});
+
+	it('falls back to legacy TPEX endpoint when OpenAPI is redirected', async () => {
+		const env = buildEnv(createR2(), { ADMIN_REFRESH_TOKEN: 'secret-token' });
+		const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+			const url = String(input);
+			if (url.includes('twse.com.tw')) {
+				return new Response(TWSE_CSV, { status: 200 });
+			}
+			if (url.includes('/openapi/v1/')) {
+				return new Response(null, {
+					status: 302,
+					headers: { Location: 'https://www.tpex.org.tw/errors' }
+				});
+			}
+			if (url.includes('stk_quote_result.php')) {
+				return new Response(
+					JSON.stringify({
+						date: '20260210',
+						tables: [
+							{
+								title: '上櫃股票行情',
+								fields: ['代號', '名稱', '收盤'],
+								data: [['006201', '元大富櫃50', '29.08']]
+							}
+						]
+					}),
+					{
+						status: 200,
+						headers: { 'Content-Type': 'application/json' }
+					}
+				);
+			}
+			return new Response('not found', { status: 404 });
+		});
+		vi.stubGlobal('fetch', fetchMock);
+
+		const response = await callManualRefresh(env, { 'x-admin-token': 'secret-token' });
+		const json = (await response.json()) as any;
+
+		expect(response.status).toBe(200);
+		expect(json.ok).toBe(true);
+		expect(json.partial).toBe(false);
+		expect(json.tpex.error).toBeUndefined();
+		expect(json.tpex.updated).toBe(true);
+		expect(json.tpex.tradingDate).toBe('2026-02-10');
+		expect(json.tpex.quoteCount).toBe(1);
+	});
+
+	it('returns 500 when both sources fail', async () => {
+		const env = buildEnv(createR2(), { ADMIN_REFRESH_TOKEN: 'secret-token' });
+		const fetchMock = vi.fn(async () => new Response('upstream error', { status: 500 }));
+		vi.stubGlobal('fetch', fetchMock);
+
+		const response = await callManualRefresh(env, { 'x-admin-token': 'secret-token' });
+		const json = (await response.json()) as any;
+
+		expect(response.status).toBe(500);
+		expect(json.ok).toBe(false);
+		expect(json.partial).toBe(false);
+		expect(json.twse.error).toMatch('TWSE EOD fetch failed');
+		expect(json.tpex.error).toMatch('TPEX EOD fetch failed');
 	});
 });

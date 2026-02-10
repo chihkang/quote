@@ -1,7 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import worker from '../src/index';
 import { l1Clear } from '../src/l1Cache';
-import { clearTwEodL1Cache, TW_EOD_LATEST_KEY, type TwEodSnapshot } from '../src/twEod';
+import {
+	clearTwEodL1Cache,
+	TPEX_EOD_LATEST_KEY,
+	TWSE_EOD_LATEST_KEY,
+	type TwEodSnapshot
+} from '../src/twEod';
 
 type KVPutOptions = {
 	expirationTtl?: number;
@@ -101,7 +106,7 @@ describe('TW EOD fallback behavior', () => {
 		vi.setSystemTime(new Date('2026-02-10T06:00:00.000Z')); // 14:00 Asia/Taipei
 		const kv = createKv();
 		const r2 = createR2({
-			[TW_EOD_LATEST_KEY]: JSON.stringify(buildTwEodSnapshot())
+			[TWSE_EOD_LATEST_KEY]: JSON.stringify(buildTwEodSnapshot())
 		});
 
 		const fetchMock = vi.fn();
@@ -120,7 +125,7 @@ describe('TW EOD fallback behavior', () => {
 		vi.setSystemTime(new Date('2026-02-10T02:00:00.000Z')); // 10:00 Asia/Taipei
 		const kv = createKv();
 		const r2 = createR2({
-			[TW_EOD_LATEST_KEY]: JSON.stringify(buildTwEodSnapshot())
+			[TWSE_EOD_LATEST_KEY]: JSON.stringify(buildTwEodSnapshot())
 		});
 
 		const fetchMock = vi.fn(async () => new Response('rate limited', { status: 429 }));
@@ -144,7 +149,7 @@ describe('TW EOD fallback behavior', () => {
 			'sys:tw:fugle:block_until': String(nowMs + 60_000)
 		});
 		const r2 = createR2({
-			[TW_EOD_LATEST_KEY]: JSON.stringify(buildTwEodSnapshot())
+			[TWSE_EOD_LATEST_KEY]: JSON.stringify(buildTwEodSnapshot())
 		});
 
 		const fetchMock = vi.fn();
@@ -165,7 +170,7 @@ describe('TW EOD fallback behavior', () => {
 			'sys:tw:fugle:block_until': String(nowMs - 1)
 		});
 		const r2 = createR2({
-			[TW_EOD_LATEST_KEY]: JSON.stringify(buildTwEodSnapshot())
+			[TWSE_EOD_LATEST_KEY]: JSON.stringify(buildTwEodSnapshot())
 		});
 
 		const fetchMock = vi.fn(async () =>
@@ -183,5 +188,38 @@ describe('TW EOD fallback behavior', () => {
 		expect(json.results[0].price).toBe(1090);
 		expect(json.results[0].status).toBe('fresh');
 		expect(json.results[0].reason).toBeNull();
+	});
+
+	it('falls back to TPEX snapshot when TWSE snapshot misses symbol', async () => {
+		vi.setSystemTime(new Date('2026-02-10T06:00:00.000Z')); // 14:00 Asia/Taipei
+		const kv = createKv();
+		const r2 = createR2({
+			[TWSE_EOD_LATEST_KEY]: JSON.stringify(
+				buildTwEodSnapshot({
+					quotes: {
+						'2330': { close: 1080, name: '台積電' }
+					}
+				})
+			),
+			[TPEX_EOD_LATEST_KEY]: JSON.stringify({
+				tradingDate: '2026-02-10',
+				fetchedAt: '2026-02-10T06:00:00.000Z',
+				source: 'TPEX_STK_QUOTE_RESULT',
+				quotes: {
+					'006201': { close: 29.08, name: '元大富櫃50' }
+				}
+			} satisfies TwEodSnapshot)
+		});
+
+		const fetchMock = vi.fn();
+		vi.stubGlobal('fetch', fetchMock);
+
+		const response = await callTwBatch(makeEnv({ kv, r2 }), ['006201']);
+		const json = (await response.json()) as any;
+
+		expect(fetchMock).not.toHaveBeenCalled();
+		expect(json.results[0].price).toBe(29.08);
+		expect(json.results[0].reason).toBe('TW_EOD_OFFHOURS');
+		expect(json.results[0].status).toBe('fresh');
 	});
 });

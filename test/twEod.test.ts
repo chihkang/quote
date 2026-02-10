@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { parseTwseStockDayAllCsv } from '../src/twEod';
+import { parseTpexDailyCloseJson, parseTwseStockDayAllCsv } from '../src/twEod';
 
 function buildCsv(rows: Array<{ date: string; symbol: string; name: string; close: string }>): string {
 	const header = '日期,證券代號,證券名稱,收盤價';
@@ -48,5 +48,86 @@ describe('parseTwseStockDayAllCsv', () => {
 
 		expect(snapshot.quotes['0050']?.close).toBeNull();
 		expect(snapshot.quotes['006203']?.close).toBe(136.4);
+	});
+});
+
+describe('parseTpexDailyCloseJson', () => {
+	it('parses tpex openapi rows and maps code to close', () => {
+		const payload = [
+			{
+				Date: '1150210',
+				SecuritiesCompanyCode: '006201',
+				CompanyName: '元大富櫃50',
+				Close: '29.08'
+			},
+			{
+				Date: '1150210',
+				SecuritiesCompanyCode: '020001',
+				CompanyName: '富邦存股雙十N',
+				Close: ' ---'
+			}
+		];
+
+		const snapshot = parseTpexDailyCloseJson(payload, '2026-02-10T06:00:00.000Z');
+
+		expect(snapshot.source).toBe('TPEX_OPENAPI_MAINBOARD_DAILY_CLOSE_QUOTES');
+		expect(snapshot.tradingDate).toBe('2026-02-10');
+		expect(snapshot.quotes['006201']?.close).toBe(29.08);
+		expect(snapshot.quotes['020001']?.close).toBeNull();
+	});
+
+	it('parses tpex payload and maps code to close', () => {
+		const payload = {
+			date: '20260210',
+			tables: [
+				{
+					title: '上櫃股票行情',
+					fields: ['代號', '名稱', '收盤'],
+					data: [
+						['006201', '元大富櫃50', '29.08'],
+						['8069', '元太', '185.00']
+					]
+				}
+			]
+		};
+
+		const snapshot = parseTpexDailyCloseJson(payload, '2026-02-10T06:00:00.000Z');
+
+		expect(snapshot.tradingDate).toBe('2026-02-10');
+		expect(snapshot.quotes['006201']?.close).toBe(29.08);
+		expect(snapshot.quotes['006201']?.name).toBe('元大富櫃50');
+		expect(snapshot.quotes['8069']?.close).toBe(185);
+	});
+
+	it('stores null for non-numeric close', () => {
+		const payload = {
+			date: '20260210',
+			tables: [
+				{
+					title: '上櫃股票行情',
+					fields: ['代號', '名稱', '收盤'],
+					data: [['020001', '富邦存股雙十N', ' ---']]
+				}
+			]
+		};
+
+		const snapshot = parseTpexDailyCloseJson(payload, '2026-02-10T06:00:00.000Z');
+		expect(snapshot.quotes['020001']?.close).toBeNull();
+	});
+
+	it('falls back to table roc date', () => {
+		const payload = {
+			tables: [
+				{
+					title: '上櫃股票行情',
+					date: '115/02/10',
+					fields: ['代號', '名稱', '收盤'],
+					data: [['006201', '元大富櫃50', '29.08']]
+				}
+			]
+		};
+
+		const snapshot = parseTpexDailyCloseJson(payload, '2026-02-10T06:00:00.000Z');
+		expect(snapshot.tradingDate).toBe('2026-02-10');
 	});
 });

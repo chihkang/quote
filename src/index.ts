@@ -5,9 +5,12 @@ import { normalizeSymbols, type NormalizedSymbol } from './symbols';
 import { getTaipeiParts, isTradingSessionTW } from './time';
 import { getTtlSeconds } from './ttl';
 import {
-	getLatestTwEodSnapshot,
+	getLatestTpexEodSnapshot,
+	getLatestTwseEodSnapshot,
 	getTwEodQuote,
-	refreshTwEodSnapshot,
+	refreshTpexEodSnapshot,
+	refreshTwseEodSnapshot,
+	type RefreshResult,
 	type TwEodSnapshot
 } from './twEod';
 
@@ -32,6 +35,7 @@ export type Env = {
 	OFFHOURS_OPEN_BUFFER_SEC?: string;
 	L1_TTL_SEC?: string;
 	TWSE_EOD_URL?: string;
+	TPEX_EOD_URL?: string;
 	TW_EOD_PATCH_ROWS?: string;
 	TW_429_BLOCK_SEC?: string;
 	TW_EOD_L1_SEC?: string;
@@ -343,6 +347,17 @@ function getAdminTokenFromRequest(request: Request): string | null {
 	return bearerToken || null;
 }
 
+type RefreshResponse = RefreshResult & { error?: string };
+
+function toRefreshError(error: unknown): string {
+	if (error instanceof Error && error.message) return error.message;
+	return 'UNKNOWN_ERROR';
+}
+
+function hasRefreshError(result: RefreshResponse): boolean {
+	return typeof result.error === 'string' && result.error.length > 0;
+}
+
 async function handleManualTwEodRefresh(request: Request, env: Env): Promise<Response> {
 	if (!env.TW_EOD_R2) {
 		return errorResponse('TW_EOD_R2 is not configured', 500);
@@ -360,16 +375,50 @@ async function handleManualTwEodRefresh(request: Request, env: Env): Promise<Res
 
 	try {
 		const now = new Date();
-		const result = await refreshTwEodSnapshot(env, now);
-		return jsonResponse({
-			ok: true,
-			trigger: 'manual',
-			serverTime: now.toISOString(),
-			...result
-		});
+		const [twseResult, tpexResult] = await Promise.all([
+			refreshTwseEodSnapshot(env, now).catch(
+				(error) =>
+					({
+						updated: false,
+						tradingDate: null,
+						quoteCount: 0,
+						deletedCount: 0,
+						error: toRefreshError(error)
+					}) as RefreshResponse
+			),
+			refreshTpexEodSnapshot(env, now).catch(
+				(error) =>
+					({
+						updated: false,
+						tradingDate: null,
+						quoteCount: 0,
+						deletedCount: 0,
+						error: toRefreshError(error)
+					}) as RefreshResponse
+			)
+		]);
+
+		const twse = twseResult as RefreshResponse;
+		const tpex = tpexResult as RefreshResponse;
+		const twseOk = !hasRefreshError(twse);
+		const tpexOk = !hasRefreshError(tpex);
+		const ok = twseOk || tpexOk;
+		const partial = twseOk !== tpexOk;
+
+		return jsonResponse(
+			{
+				ok,
+				partial,
+				trigger: 'manual',
+				serverTime: now.toISOString(),
+				twse,
+				tpex
+			},
+			ok ? 200 : 500
+		);
 	} catch (error) {
-		console.error('TWSE EOD manual refresh failed', error);
-		return errorResponse('TWSE EOD manual refresh failed', 500);
+		console.error('TWSE/TPEX EOD manual refresh failed', error);
+		return errorResponse('TWSE/TPEX EOD manual refresh failed', 500);
 	}
 }
 
@@ -435,22 +484,67 @@ export default {
 
 		const results: QuoteResult[] = new Array(normalizedList.length);
 		const missingForFetch: Array<{ index: number; item: NormalizedSymbol; reason: string }> = [];
-		let twOffhoursSnapshot: TwEodSnapshot | null | undefined = undefined;
+		let twseSnapshot: TwEodSnapshot | null | undefined = undefined;
+		let tpexSnapshot: TwEodSnapshot | null | undefined = undefined;
+
+		const getTwseSnapshot = async () => {
+			if (twseSnapshot === undefined) {
+				twseSnapshot = await getLatestTwseEodSnapshot(env, nowMs);
+			}
+			return twseSnapshot;
+		};
+
+		const getTpexSnapshot = async () => {
+			if (tpexSnapshot === undefined) {
+				tpexSnapshot = await getLatestTpexEodSnapshot(env, nowMs);
+			}
+			return tpexSnapshot;
+		};
+
+		const buildFromTwEodChain = async (
+			item: NormalizedSymbol,
+			hitReason: 'TW_EOD_OFFHOURS' | 'TW_EOD_FALLBACK_429',
+			hitStatus: 'fresh' | 'stale'
+		): Promise<QuoteResult> => {
+			const twse = await getTwseSnapshot();
+			const twseQuote = getTwEodQuote(twse, item.ticker);
+			if (twse && twseQuote && twseQuote.close !== null) {
+				return buildFromTwEod(item, twse, hitReason, hitStatus);
+			}
+
+			const tpex = await getTpexSnapshot();
+			const tpexQuote = getTwEodQuote(tpex, item.ticker);
+			if (tpex && tpexQuote && tpexQuote.close !== null) {
+				return buildFromTwEod(item, tpex, hitReason, hitStatus);
+			}
+
+			return {
+				symbol: item.originalSymbol,
+				canonicalSymbol: item.canonicalSymbol,
+				market: item.market,
+				price: null,
+				currency: null,
+				asOf: null,
+				fetchedAt: tpex?.fetchedAt ?? twse?.fetchedAt ?? null,
+				ttlHardSec: null,
+				expiresAt: null,
+				status: 'missing',
+				isStale: false,
+				reason: 'TW_EOD_MISS'
+			};
+		};
 
 		for (let i = 0; i < normalizedList.length; i += 1) {
 			const item = normalizedList[i];
 
-			// Outside TW trading hours, prefer TWSE EOD snapshot when available.
+			// Outside TW trading hours, prefer TWSE first and then TPEX EOD snapshots.
 			if (item.market === 'TW' && !twTrading && env.TW_EOD_R2) {
-				if (twOffhoursSnapshot === undefined) {
-					twOffhoursSnapshot = await getLatestTwEodSnapshot(env, nowMs);
-				}
-				if (twOffhoursSnapshot) {
-					const eodResult = buildFromTwEod(item, twOffhoursSnapshot, 'TW_EOD_OFFHOURS', 'fresh');
+				const eodResult = await buildFromTwEodChain(item, 'TW_EOD_OFFHOURS', 'fresh');
+				if (eodResult.reason !== 'TW_EOD_MISS') {
 					l1Set(item.kvKey, eodResult, l1TtlSec, nowMs);
-					results[i] = eodResult;
-					continue;
 				}
+				results[i] = eodResult;
+				continue;
 			}
 
 			const l1Hit = l1Get<QuoteResult>(item.kvKey, nowMs);
@@ -484,13 +578,6 @@ export default {
 			const usTargets = fetchTargets.filter(({ item }) => item.market === 'US');
 
 			let twRateLimited = false;
-			let twFallbackSnapshot: TwEodSnapshot | null | undefined = undefined;
-			const ensureTwFallbackSnapshot = async () => {
-				if (twFallbackSnapshot === undefined) {
-					twFallbackSnapshot = await getLatestTwEodSnapshot(env);
-				}
-				return twFallbackSnapshot;
-			};
 
 			if (twTargets.length > 0 && twTrading) {
 				const blockedUntilMs = await getTwFugleBlockUntilMs(env);
@@ -499,12 +586,7 @@ export default {
 
 			for (const { index, item } of twTargets) {
 				if (twRateLimited) {
-					results[index] = buildFromTwEod(
-						item,
-						await ensureTwFallbackSnapshot(),
-						'TW_EOD_FALLBACK_429',
-						'stale'
-					);
+					results[index] = await buildFromTwEodChain(item, 'TW_EOD_FALLBACK_429', 'stale');
 					continue;
 				}
 
@@ -558,12 +640,7 @@ export default {
 					if (isRateLimited(error)) {
 						twRateLimited = true;
 						await setTwFugleBlockUntilMs(env, Date.now(), toNumber(env.TW_429_BLOCK_SEC, 60));
-						results[index] = buildFromTwEod(
-							item,
-							await ensureTwFallbackSnapshot(),
-							'TW_EOD_FALLBACK_429',
-							'stale'
-						);
+						results[index] = await buildFromTwEodChain(item, 'TW_EOD_FALLBACK_429', 'stale');
 						continue;
 					}
 
@@ -647,19 +724,47 @@ export default {
 	async scheduled(event: ScheduledController, env: Env): Promise<void> {
 		try {
 			const now = new Date();
-			console.log('TWSE EOD scheduled triggered', {
+			console.log('TWSE/TPEX EOD scheduled triggered', {
 				cron: event.cron,
 				scheduledTime: new Date(event.scheduledTime).toISOString(),
 				now: now.toISOString()
 			});
 			if (!shouldRunTwEodRefresh(now)) {
-				console.log('TWSE EOD refresh skipped by local time window', { now: now.toISOString() });
+				console.log('TWSE/TPEX EOD refresh skipped by local time window', { now: now.toISOString() });
 				return;
 			}
-			const result = await refreshTwEodSnapshot(env, now);
-			console.log('TWSE EOD refresh done', result);
+
+			const [twseResult, tpexResult] = await Promise.all([
+				refreshTwseEodSnapshot(env, now).catch(
+					(error) =>
+						({
+							updated: false,
+							tradingDate: null,
+							quoteCount: 0,
+							deletedCount: 0,
+							error: toRefreshError(error)
+						}) as RefreshResponse
+				),
+				refreshTpexEodSnapshot(env, now).catch(
+					(error) =>
+						({
+							updated: false,
+							tradingDate: null,
+							quoteCount: 0,
+							deletedCount: 0,
+							error: toRefreshError(error)
+						}) as RefreshResponse
+				)
+			]);
+
+			console.log('TWSE/TPEX EOD refresh done', {
+				twse: twseResult,
+				tpex: tpexResult,
+				ok: !hasRefreshError(twseResult as RefreshResponse) || !hasRefreshError(tpexResult as RefreshResponse),
+				partial: hasRefreshError(twseResult as RefreshResponse) !== hasRefreshError(tpexResult as RefreshResponse)
+			});
 		} catch (error) {
-			console.error('TWSE EOD refresh failed', error);
+			console.error('TWSE/TPEX EOD refresh failed', error);
 		}
 	}
 };

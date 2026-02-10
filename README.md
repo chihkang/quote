@@ -1,17 +1,17 @@
 # Quote Worker
 
-Cloudflare Worker that serves batch TW and US stock quotes via Fugle (TW) and Finnhub (US) with KV-backed caching. The worker returns results immediately with a freshness status (`fresh`, `stale`, or `missing`), fetches only a limited number of cache misses per request, and supports TWSE end-of-day fallback from R2.
+Cloudflare Worker that serves batch TW and US stock quotes via Fugle (TW) and Finnhub (US) with KV-backed caching. The worker returns results immediately with a freshness status (`fresh`, `stale`, or `missing`), fetches only a limited number of cache misses per request, and supports TWSE/TPEX end-of-day fallback from R2.
 
 ## What the project does
 
-- Provides API endpoints for quote queries and manual TWSE EOD refresh.
+- Provides API endpoints for quote queries and manual TWSE/TPEX EOD refresh.
 - Normalizes symbols (supports input like `2330`, `2330.TW`, or `TW:2330` for Taiwan; `AAPL`, `AAPL.US`, or `US:AAPL` for US).
 - Uses two-layer caching: in-memory L1 and Cloudflare KV.
-- Stores TWSE end-of-day snapshots in Cloudflare R2 (`twse/eod/latest.json` and dated snapshots).
+- Stores separate TWSE/TPEX end-of-day snapshots in Cloudflare R2.
 - Applies soft/hard TTL policies that change during TW trading hours.
 - Fetches TW quotes from Fugle API and US quotes from Finnhub API with a concurrency limit of 5 for US requests.
-- During TW off-hours, serves TW quotes from the latest TWSE close snapshot instead of calling Fugle.
-- During TW trading hours, if Fugle returns `429`, temporarily blocks Fugle calls and falls back to TWSE close snapshot.
+- During TW off-hours, serves TW quotes from EOD snapshots (query order: TWSE first, then TPEX) instead of calling Fugle.
+- During TW trading hours, if Fugle returns `429`, temporarily blocks Fugle calls and falls back to EOD snapshots (TWSE first, then TPEX).
 
 ## Why the project is useful
 
@@ -145,11 +145,130 @@ curl -X POST http://127.0.0.1:8787/quotes/batch \
 	-d '{"symbols":["AAPL","MSFT","NVDA"],"market":"US"}'
 ```
 
-Manual TWSE EOD refresh:
+Manual TWSE/TPEX EOD refresh:
 
 ```bash
 curl -X POST http://127.0.0.1:8787/admin/twse/eod/refresh \
 	-H "X-Admin-Token: <your_admin_refresh_token>"
+```
+
+Manual refresh response now returns source-level results:
+- `ok`: at least one source succeeded
+- `partial`: only one source succeeded
+- `twse`: `{ updated, tradingDate, quoteCount, deletedCount, error? }`
+- `tpex`: `{ updated, tradingDate, quoteCount, deletedCount, error? }`
+	- `error` appears only when refresh fails and there is no usable snapshot for that source.
+
+### Quote flow by market and session
+
+This section describes runtime quote lookup behavior for `POST /quotes/batch` by market and session window.
+
+#### TW market in trading session
+
+- Trading session is controlled by `TW_OPEN` and `TW_CLOSE` (default `09:00-13:30`, Asia/Taipei).
+- Lookup order:
+	- L1 in-memory cache
+	- KV cache
+	- Fugle API (only for unresolved symbols, up to `MAX_SYNC_FETCH`)
+- If Fugle returns `429`:
+	- Worker writes `sys:tw:fugle:block_until` to KV for `TW_429_BLOCK_SEC`.
+	- Current request remaining TW symbols immediately fallback to R2 EOD chain (`TWSE -> TPEX`).
+	- Requests during block window skip Fugle and directly use the same R2 fallback chain.
+- Typical response mapping:
+	- Fugle hit: `status=fresh`, `reason=null`
+	- 429 fallback hit: `status=stale`, `reason=TW_EOD_FALLBACK_429`
+	- 429 fallback miss: `status=missing`, `reason=TW_EOD_MISS`
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Worker
+    participant L1 as L1 cache
+    participant KV as KV cache
+    participant Fugle
+    participant R2 as R2 EOD (TWSE->TPEX)
+
+    Client->>Worker: POST /quotes/batch (TW)
+    Worker->>Worker: Check TW trading session
+    Worker->>L1: Read symbol
+    alt L1 hit
+        L1-->>Worker: value
+        Worker-->>Client: Return cached result
+    else L1 miss
+        Worker->>KV: Read symbol
+        alt KV fresh or stale
+            KV-->>Worker: value
+            Worker-->>Client: Return cached result
+        else KV miss or hard expired
+            Worker->>Fugle: Fetch quote
+            alt Fugle 200
+                Fugle-->>Worker: quote
+                Worker->>KV: Write cache
+                Worker->>L1: Write cache
+                Worker-->>Client: fresh, reason=null
+            else Fugle 429
+                Fugle-->>Worker: 429
+                Worker->>KV: Set block_until
+                Worker->>R2: Read TWSE latest then TPEX latest
+                Worker-->>Client: stale/missing, reason=TW_EOD_FALLBACK_429 or TW_EOD_MISS
+            end
+        end
+    end
+```
+
+#### TW market in off-hours
+
+- Off-hours means outside `TW_OPEN-TW_CLOSE`.
+- If `TW_EOD_R2` is configured, TW symbols bypass L1/KV/Fugle and directly use R2 EOD chain:
+	- `twse/eod/latest.json` first
+	- then `tpex/eod/latest.json`
+- If `TW_EOD_R2` is not configured, Worker falls back to normal L1/KV/API flow.
+- Typical response mapping:
+	- EOD hit: `status=fresh`, `reason=TW_EOD_OFFHOURS`
+	- EOD miss: `status=missing`, `reason=TW_EOD_MISS`
+
+#### US market in trading session and off-hours
+
+- US symbols do not use TW EOD R2 fallback.
+- Lookup order is the same in both US trading and off-hours:
+	- L1 in-memory cache
+	- KV cache
+	- Finnhub API (only for unresolved symbols, batched with concurrency limit 5)
+- `MAX_SYNC_FETCH` is a per-request global cap shared by TW and US unresolved symbols.
+- Main difference between US trading and off-hours is TTL policy (`getTtlSeconds`), not source order.
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Worker
+    participant L1 as L1 cache
+    participant KV as KV cache
+    participant Finnhub
+
+    Client->>Worker: POST /quotes/batch (US)
+    Worker->>Worker: Evaluate US session for TTL policy
+    Worker->>L1: Read symbol
+    alt L1 hit
+        L1-->>Worker: value
+        Worker-->>Client: Return cached result
+    else L1 miss
+        Worker->>KV: Read symbol
+        alt KV fresh or stale
+            KV-->>Worker: value
+            Worker-->>Client: Return cached result
+        else KV miss or hard expired
+            Worker->>Finnhub: Fetch quote (max 5 concurrent)
+            alt Finnhub 200
+                Finnhub-->>Worker: quote
+                Worker->>KV: Write cache
+                Worker->>L1: Write cache
+                Worker-->>Client: fresh, reason=null
+            else Finnhub error
+                Finnhub-->>Worker: error
+                Worker-->>Client: missing or unchanged, reason=FINNHUB_ERROR
+            end
+        end
+    end
 ```
 
 ### Configuration
@@ -189,20 +308,27 @@ Environment variables are defined in [wrangler.jsonc](wrangler.jsonc). Key setti
 - `OFFHOURS_OPEN_BUFFER_SEC`: Buffer seconds added to next market open time for off-hours hard TTL (default 300).
 - `L1_TTL_SEC`: In-memory cache TTL (seconds).
 - `TWSE_EOD_URL`: TWSE full-market close CSV URL.
+- `TPEX_EOD_URL`: Primary TPEX daily close source URL (default: OpenAPI `https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes`).
+	- Runtime fallback is built-in: if primary URL fails or redirects to non-JSON pages, Worker retries the legacy endpoint `https://www.tpex.org.tw/web/stock/aftertrading/DAILY_CLOSE_quotes/stk_quote_result.php?l=zh-tw&o=json`.
+	- If both upstream URLs fail but `tpex/eod/latest.json` exists, Worker keeps serving that cached snapshot and does not fail the whole refresh.
 - `TW_EOD_PATCH_ROWS`: Number of leading CSV rows to prepend `00` when symbol does not start with `00` (default `239`).
 - `TW_429_BLOCK_SEC`: Fugle 429 cooldown seconds before retrying paid API (default `60`).
-- `TW_EOD_L1_SEC`: In-memory TTL (seconds) for cached TW EOD snapshot reads from R2.
+- `TW_EOD_L1_SEC`: In-memory TTL (seconds) for cached TWSE/TPEX EOD snapshot reads from R2.
 - `ADMIN_REFRESH_TOKEN`: Secret token used by `POST /admin/twse/eod/refresh` (`X-Admin-Token` or `Authorization: Bearer`).
 
 ### Scheduled refresh
 
-- `wrangler.jsonc` defines weekday cron triggers to refresh TWSE EOD snapshots after close.
+- `wrangler.jsonc` defines weekday cron triggers to refresh TWSE/TPEX EOD snapshots after close.
 - Worker code additionally gates refresh by Asia/Taipei local time window: weekdays `13:40-18:59`.
-- Scheduled job fetches TWSE CSV, applies symbol patching rule, and writes:
+- Scheduled job fetches both sources and writes separate snapshots:
 	- `twse/eod/latest.json`
 	- `twse/eod/YYYY-MM-DD.json`
-- On the same trading date, refresh is idempotent (`updated: false`) and does not rewrite snapshot files.
-- Retention policy is one-in/one-out: after refresh, only `latest.json` and the current trading date file are kept; older dated files are deleted automatically.
+	- `tpex/eod/latest.json`
+	- `tpex/eod/YYYY-MM-DD.json`
+- Each source is refreshed independently (partial success allowed).
+- TPEX refresh attempts OpenAPI first, then the legacy JSON endpoint, and finally falls back to existing `tpex/eod/latest.json` if both upstream requests fail.
+- On the same trading date, refresh is idempotent (`updated: false`) and does not rewrite that source snapshot.
+- Retention policy is one-in/one-out per source: each source keeps only `latest.json` and the current trading-date file.
 
 ### Tests
 
