@@ -1,13 +1,22 @@
 import { l1Get, l1Set } from './l1Cache';
 import { getQuote, putQuote, type QuoteCacheValue } from './kvCache';
 import { classify, isStale } from './quotePolicy';
-import { getTtlSeconds } from './ttl';
 import { normalizeSymbols, type NormalizedSymbol } from './symbols';
+import { getTaipeiParts, isTradingSessionTW } from './time';
+import { getTtlSeconds } from './ttl';
+import {
+	getLatestTwEodSnapshot,
+	getTwEodQuote,
+	refreshTwEodSnapshot,
+	type TwEodSnapshot
+} from './twEod';
 
 export type Env = {
 	QUOTES_KV: KVNamespace;
 	FUGLE_API_KEY: string;
 	FINNHUB_API_KEY: string;
+	TW_EOD_R2?: R2Bucket;
+	ADMIN_REFRESH_TOKEN?: string;
 	DEFAULT_MARKET?: string;
 	MAX_SYNC_FETCH?: string;
 	MAX_SYMBOLS_PER_REQUEST?: string;
@@ -22,6 +31,10 @@ export type Env = {
 	HARD_TTL_OFFHOURS_SEC?: string;
 	OFFHOURS_OPEN_BUFFER_SEC?: string;
 	L1_TTL_SEC?: string;
+	TWSE_EOD_URL?: string;
+	TW_EOD_PATCH_ROWS?: string;
+	TW_429_BLOCK_SEC?: string;
+	TW_EOD_L1_SEC?: string;
 };
 
 type QuoteResult = {
@@ -39,10 +52,22 @@ type QuoteResult = {
 	reason: string | null;
 };
 
+class HttpStatusError extends Error {
+	status: number;
+
+	constructor(message: string, status: number) {
+		super(message);
+		this.name = 'HttpStatusError';
+		this.status = status;
+	}
+}
+
+const TW_FUGLE_BLOCK_KEY = 'sys:tw:fugle:block_until';
+
 const corsHeaders = {
 	'Access-Control-Allow-Origin': '*',
 	'Access-Control-Allow-Methods': 'POST, OPTIONS',
-	'Access-Control-Allow-Headers': 'Content-Type',
+	'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Admin-Token',
 	'Access-Control-Max-Age': '86400'
 };
 
@@ -81,6 +106,13 @@ function toIsoFromEpoch(value: unknown): string | null {
 	const date = new Date(ms);
 	if (Number.isNaN(date.getTime())) return null;
 	return date.toISOString();
+}
+
+function eodAsOf(tradingDate: string): string | null {
+	if (!tradingDate) return null;
+	const iso = new Date(`${tradingDate}T13:30:00+08:00`);
+	if (Number.isNaN(iso.getTime())) return null;
+	return iso.toISOString();
 }
 
 function extractQuote(data: any): { price: number | null; currency: string | null; asOf: string | null } {
@@ -143,7 +175,7 @@ async function fetchFugleQuote(symbol: string, env: Env) {
 	});
 
 	if (!response.ok) {
-		throw new Error(`Fugle API error: ${response.status}`);
+		throw new HttpStatusError(`Fugle API error: ${response.status}`, response.status);
 	}
 
 	const data = await response.json();
@@ -169,7 +201,7 @@ async function fetchFinnhubQuote(symbol: string, env: Env) {
 	const response = await fetch(url);
 
 	if (!response.ok) {
-		throw new Error(`Finnhub API error: ${response.status}`);
+		throw new HttpStatusError(`Finnhub API error: ${response.status}`, response.status);
 	}
 
 	const data = await response.json();
@@ -224,6 +256,46 @@ async function buildMissing(normalized: NormalizedSymbol, reason: string): Promi
 	};
 }
 
+function buildFromTwEod(
+	normalized: NormalizedSymbol,
+	snapshot: TwEodSnapshot | null,
+	hitReason: 'TW_EOD_OFFHOURS' | 'TW_EOD_FALLBACK_429',
+	hitStatus: 'fresh' | 'stale'
+): QuoteResult {
+	const quote = getTwEodQuote(snapshot, normalized.ticker);
+	if (!snapshot || !quote || quote.close === null) {
+		return {
+			symbol: normalized.originalSymbol,
+			canonicalSymbol: normalized.canonicalSymbol,
+			market: normalized.market,
+			price: null,
+			currency: null,
+			asOf: null,
+			fetchedAt: snapshot?.fetchedAt ?? null,
+			ttlHardSec: null,
+			expiresAt: null,
+			status: 'missing',
+			isStale: false,
+			reason: 'TW_EOD_MISS'
+		};
+	}
+
+	return {
+		symbol: normalized.originalSymbol,
+		canonicalSymbol: normalized.canonicalSymbol,
+		market: normalized.market,
+		price: quote.close,
+		currency: 'TWD',
+		asOf: eodAsOf(snapshot.tradingDate),
+		fetchedAt: snapshot.fetchedAt,
+		ttlHardSec: null,
+		expiresAt: null,
+		status: hitStatus,
+		isStale: hitStatus === 'stale',
+		reason: hitReason
+	};
+}
+
 function jitterSec(): number {
 	return Math.floor(Math.random() * 301);
 }
@@ -235,6 +307,71 @@ function computeExpiresAt(fetchedAt: string, hardTtlSec: number): string {
 	return new Date(storedAtMs + safeHard * 1000).toISOString();
 }
 
+function isRateLimited(error: unknown): boolean {
+	return error instanceof HttpStatusError && error.status === 429;
+}
+
+async function getTwFugleBlockUntilMs(env: Env): Promise<number | null> {
+	const raw = await env.QUOTES_KV.get(TW_FUGLE_BLOCK_KEY);
+	if (!raw) return null;
+	const parsed = Number(raw);
+	return Number.isFinite(parsed) ? parsed : null;
+}
+
+async function setTwFugleBlockUntilMs(env: Env, baseMs: number, blockSec: number): Promise<void> {
+	const safeBlockSec = Math.max(1, Math.floor(blockSec));
+	const blockUntilMs = baseMs + safeBlockSec * 1000;
+	await env.QUOTES_KV.put(TW_FUGLE_BLOCK_KEY, String(blockUntilMs), {
+		expirationTtl: safeBlockSec
+	});
+}
+
+function shouldRunTwEodRefresh(now = new Date()): boolean {
+	const parts = getTaipeiParts(now);
+	if (parts.weekday < 1 || parts.weekday > 5) return false;
+	if (parts.hour === 13) return parts.minute >= 40;
+	return parts.hour >= 14 && parts.hour <= 18;
+}
+
+function getAdminTokenFromRequest(request: Request): string | null {
+	const headerToken = request.headers.get('x-admin-token')?.trim();
+	if (headerToken) return headerToken;
+	const authHeader = request.headers.get('authorization')?.trim();
+	if (!authHeader) return null;
+	if (!authHeader.toLowerCase().startsWith('bearer ')) return null;
+	const bearerToken = authHeader.slice(7).trim();
+	return bearerToken || null;
+}
+
+async function handleManualTwEodRefresh(request: Request, env: Env): Promise<Response> {
+	if (!env.TW_EOD_R2) {
+		return errorResponse('TW_EOD_R2 is not configured', 500);
+	}
+
+	const expectedToken = env.ADMIN_REFRESH_TOKEN?.trim();
+	if (!expectedToken) {
+		return errorResponse('ADMIN_REFRESH_TOKEN is not configured', 503);
+	}
+
+	const providedToken = getAdminTokenFromRequest(request);
+	if (!providedToken || providedToken !== expectedToken) {
+		return errorResponse('Unauthorized', 401);
+	}
+
+	try {
+		const now = new Date();
+		const result = await refreshTwEodSnapshot(env, now);
+		return jsonResponse({
+			ok: true,
+			trigger: 'manual',
+			serverTime: now.toISOString(),
+			...result
+		});
+	} catch (error) {
+		console.error('TWSE EOD manual refresh failed', error);
+		return errorResponse('TWSE EOD manual refresh failed', 500);
+	}
+}
 
 export default {
 	async fetch(request: Request, env: Env): Promise<Response> {
@@ -242,11 +379,18 @@ export default {
 			return new Response(null, { status: 204, headers: corsHeaders });
 		}
 
+		const pathname = new URL(request.url).pathname;
+		if (pathname === '/admin/twse/eod/refresh') {
+			if (request.method !== 'POST') {
+				return errorResponse('Method Not Allowed', 405);
+			}
+			return handleManualTwEodRefresh(request, env);
+		}
+
 		if (request.method !== 'POST') {
 			return errorResponse('Method Not Allowed', 405);
 		}
 
-		const pathname = new URL(request.url).pathname;
 		if (pathname !== '/quotes/batch') {
 			return errorResponse('Not Found', 404);
 		}
@@ -271,9 +415,7 @@ export default {
 			return errorResponse(`symbols exceeds max ${maxSymbols}`, 400);
 		}
 
-		const symbols = symbolsRaw
-			.map((item) => String(item).trim())
-			.filter((item) => item.length > 0);
+		const symbols = symbolsRaw.map((item) => String(item).trim()).filter((item) => item.length > 0);
 
 		if (symbols.length === 0) {
 			return errorResponse('symbols cannot be empty', 400);
@@ -287,14 +429,29 @@ export default {
 
 		const now = new Date();
 		const nowMs = now.getTime();
+		const twTrading = isTradingSessionTW(now, env.TW_OPEN ?? '09:00', env.TW_CLOSE ?? '13:30');
 		const l1TtlSec = toNumber(env.L1_TTL_SEC, 20);
 		const maxSyncFetch = toNumber(env.MAX_SYNC_FETCH, 10);
 
 		const results: QuoteResult[] = new Array(normalizedList.length);
 		const missingForFetch: Array<{ index: number; item: NormalizedSymbol; reason: string }> = [];
+		let twOffhoursSnapshot: TwEodSnapshot | null | undefined = undefined;
 
 		for (let i = 0; i < normalizedList.length; i += 1) {
 			const item = normalizedList[i];
+
+			// Outside TW trading hours, prefer TWSE EOD snapshot when available.
+			if (item.market === 'TW' && !twTrading && env.TW_EOD_R2) {
+				if (twOffhoursSnapshot === undefined) {
+					twOffhoursSnapshot = await getLatestTwEodSnapshot(env, nowMs);
+				}
+				if (twOffhoursSnapshot) {
+					const eodResult = buildFromTwEod(item, twOffhoursSnapshot, 'TW_EOD_OFFHOURS', 'fresh');
+					l1Set(item.kvKey, eodResult, l1TtlSec, nowMs);
+					results[i] = eodResult;
+					continue;
+				}
+			}
 
 			const l1Hit = l1Get<QuoteResult>(item.kvKey, nowMs);
 			if (l1Hit) {
@@ -323,11 +480,34 @@ export default {
 
 		if (missingForFetch.length > 0 && maxSyncFetch > 0) {
 			const fetchTargets = missingForFetch.slice(0, maxSyncFetch);
-
 			const twTargets = fetchTargets.filter(({ item }) => item.market === 'TW');
 			const usTargets = fetchTargets.filter(({ item }) => item.market === 'US');
 
-			const twPromises = twTargets.map(async ({ index, item }) => {
+			let twRateLimited = false;
+			let twFallbackSnapshot: TwEodSnapshot | null | undefined = undefined;
+			const ensureTwFallbackSnapshot = async () => {
+				if (twFallbackSnapshot === undefined) {
+					twFallbackSnapshot = await getLatestTwEodSnapshot(env);
+				}
+				return twFallbackSnapshot;
+			};
+
+			if (twTargets.length > 0 && twTrading) {
+				const blockedUntilMs = await getTwFugleBlockUntilMs(env);
+				twRateLimited = blockedUntilMs !== null && blockedUntilMs > nowMs;
+			}
+
+			for (const { index, item } of twTargets) {
+				if (twRateLimited) {
+					results[index] = buildFromTwEod(
+						item,
+						await ensureTwFallbackSnapshot(),
+						'TW_EOD_FALLBACK_429',
+						'stale'
+					);
+					continue;
+				}
+
 				try {
 					const fetchedAt = new Date().toISOString();
 					const { price, currency, asOf } = await fetchFugleQuote(item.ticker, env);
@@ -338,7 +518,7 @@ export default {
 							...results[index],
 							reason: 'FUGLE_ERROR'
 						};
-						return;
+						continue;
 					}
 
 					const ttl = getTtlSeconds(item.market, new Date(fetchedAt), env);
@@ -375,16 +555,27 @@ export default {
 					l1Set(item.kvKey, freshResult, l1TtlSec);
 					results[index] = freshResult;
 				} catch (error) {
+					if (isRateLimited(error)) {
+						twRateLimited = true;
+						await setTwFugleBlockUntilMs(env, Date.now(), toNumber(env.TW_429_BLOCK_SEC, 60));
+						results[index] = buildFromTwEod(
+							item,
+							await ensureTwFallbackSnapshot(),
+							'TW_EOD_FALLBACK_429',
+							'stale'
+						);
+						continue;
+					}
+
 					console.error('Fugle quote failed', { symbol: item.ticker, error });
 					results[index] = {
 						...results[index],
 						reason: 'FUGLE_ERROR'
 					};
 				}
-			});
+			}
 
 			const concurrencyLimit = 5;
-			const twPromise = Promise.all(twPromises);
 			for (let i = 0; i < usTargets.length; i += concurrencyLimit) {
 				const batch = usTargets.slice(i, i + concurrencyLimit);
 				await Promise.all(
@@ -445,13 +636,30 @@ export default {
 					})
 				);
 			}
-
-			await twPromise;
 		}
 
 		return jsonResponse({
 			serverTime: now.toISOString(),
 			results
 		});
+	},
+
+	async scheduled(event: ScheduledController, env: Env): Promise<void> {
+		try {
+			const now = new Date();
+			console.log('TWSE EOD scheduled triggered', {
+				cron: event.cron,
+				scheduledTime: new Date(event.scheduledTime).toISOString(),
+				now: now.toISOString()
+			});
+			if (!shouldRunTwEodRefresh(now)) {
+				console.log('TWSE EOD refresh skipped by local time window', { now: now.toISOString() });
+				return;
+			}
+			const result = await refreshTwEodSnapshot(env, now);
+			console.log('TWSE EOD refresh done', result);
+		} catch (error) {
+			console.error('TWSE EOD refresh failed', error);
+		}
 	}
 };

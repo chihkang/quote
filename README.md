@@ -1,14 +1,17 @@
 # Quote Worker
 
-Cloudflare Worker that serves batch TW and US stock quotes via Fugle (TW) and Finnhub (US) with KV-backed caching. The worker returns results immediately with a freshness status (`fresh`, `stale`, or `missing`) and only fetches from external APIs for a limited number of cache misses per request.
+Cloudflare Worker that serves batch TW and US stock quotes via Fugle (TW) and Finnhub (US) with KV-backed caching. The worker returns results immediately with a freshness status (`fresh`, `stale`, or `missing`), fetches only a limited number of cache misses per request, and supports TWSE end-of-day fallback from R2.
 
 ## What the project does
 
-- Provides a single HTTP endpoint to fetch batch quotes for TW and US markets.
+- Provides API endpoints for quote queries and manual TWSE EOD refresh.
 - Normalizes symbols (supports input like `2330`, `2330.TW`, or `TW:2330` for Taiwan; `AAPL`, `AAPL.US`, or `US:AAPL` for US).
 - Uses two-layer caching: in-memory L1 and Cloudflare KV.
+- Stores TWSE end-of-day snapshots in Cloudflare R2 (`twse/eod/latest.json` and dated snapshots).
 - Applies soft/hard TTL policies that change during TW trading hours.
 - Fetches TW quotes from Fugle API and US quotes from Finnhub API with a concurrency limit of 5 for US requests.
+- During TW off-hours, serves TW quotes from the latest TWSE close snapshot instead of calling Fugle.
+- During TW trading hours, if Fugle returns `429`, temporarily blocks Fugle calls and falls back to TWSE close snapshot.
 
 ## Why the project is useful
 
@@ -41,7 +44,7 @@ Cloudflare Worker that serves batch TW and US stock quotes via Fugle (TW) and Fi
 	 OFFHOURS_OPEN_BUFFER_SEC=180
 	 ```
 
-3. Update KV namespace IDs in [wrangler.jsonc](wrangler.jsonc).
+3. Update KV/R2 binding IDs and names in [wrangler.jsonc](wrangler.jsonc).
 
 4. Start the local dev server:
 
@@ -56,6 +59,7 @@ For production deployments, you must set API keys as Worker secrets in your Clou
 ```bash
 wrangler secret put FUGLE_API_KEY
 wrangler secret put FINNHUB_API_KEY
+wrangler secret put ADMIN_REFRESH_TOKEN
 ```
 
 If you deploy to multiple environments, repeat the secret setup per environment.
@@ -121,7 +125,7 @@ Response:
 - `expiresAt`: Cache expiry time (ISO) derived from `fetchedAt + ttlHardSec`.
 - `status`: `fresh`, `stale`, or `missing`.
 - `isStale`: Whether the value exceeded the soft TTL.
-- `reason`: One of `KV_MISS`, `HARD_EXPIRED`, `FUGLE_ERROR`, `FINNHUB_ERROR`, or `null`.
+- `reason`: One of `KV_MISS`, `HARD_EXPIRED`, `FUGLE_ERROR`, `FINNHUB_ERROR`, `TW_EOD_OFFHOURS`, `TW_EOD_FALLBACK_429`, `TW_EOD_MISS`, or `null`.
 
 ### Curl example
 
@@ -139,6 +143,13 @@ US market:
 curl -X POST http://127.0.0.1:8787/quotes/batch \
 	-H "Content-Type: application/json" \
 	-d '{"symbols":["AAPL","MSFT","NVDA"],"market":"US"}'
+```
+
+Manual TWSE EOD refresh:
+
+```bash
+curl -X POST http://127.0.0.1:8787/admin/twse/eod/refresh \
+	-H "X-Admin-Token: <your_admin_refresh_token>"
 ```
 
 ### Configuration
@@ -177,6 +188,21 @@ Environment variables are defined in [wrangler.jsonc](wrangler.jsonc). Key setti
 - `HARD_TTL_OFFHOURS_SEC`: Legacy fallback (not used for TW/US dynamic off-hours TTLs).
 - `OFFHOURS_OPEN_BUFFER_SEC`: Buffer seconds added to next market open time for off-hours hard TTL (default 300).
 - `L1_TTL_SEC`: In-memory cache TTL (seconds).
+- `TWSE_EOD_URL`: TWSE full-market close CSV URL.
+- `TW_EOD_PATCH_ROWS`: Number of leading CSV rows to prepend `00` when symbol does not start with `00` (default `239`).
+- `TW_429_BLOCK_SEC`: Fugle 429 cooldown seconds before retrying paid API (default `60`).
+- `TW_EOD_L1_SEC`: In-memory TTL (seconds) for cached TW EOD snapshot reads from R2.
+- `ADMIN_REFRESH_TOKEN`: Secret token used by `POST /admin/twse/eod/refresh` (`X-Admin-Token` or `Authorization: Bearer`).
+
+### Scheduled refresh
+
+- `wrangler.jsonc` defines weekday cron triggers to refresh TWSE EOD snapshots after close.
+- Worker code additionally gates refresh by Asia/Taipei local time window: weekdays `13:40-18:59`.
+- Scheduled job fetches TWSE CSV, applies symbol patching rule, and writes:
+	- `twse/eod/latest.json`
+	- `twse/eod/YYYY-MM-DD.json`
+- On the same trading date, refresh is idempotent (`updated: false`) and does not rewrite snapshot files.
+- Retention policy is one-in/one-out: after refresh, only `latest.json` and the current trading date file are kept; older dated files are deleted automatically.
 
 ### Tests
 

@@ -16,6 +16,18 @@
 			"remote": true
 		}
 	],
+	"r2_buckets": [
+		{
+			"binding": "TW_EOD_R2",
+			"bucket_name": "quote-tw-eod",
+			"preview_bucket_name": "quote-tw-eod"
+		}
+	],
+	"triggers": {
+		"crons": [
+			"*/10 * * * 2-6"
+		]
+	},
 	"vars": {
 		"DEFAULT_MARKET": "TW",
 		"MAX_SYNC_FETCH": "10",
@@ -30,6 +42,10 @@
 		"SOFT_TTL_OFFHOURS_SEC": "300",
 		"HARD_TTL_OFFHOURS_SEC": "259200",
 		"OFFHOURS_OPEN_BUFFER_SEC": "300",
-		"L1_TTL_SEC": "20"
+		"L1_TTL_SEC": "20",
+		"TWSE_EOD_URL": "https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL?response=open_data",
+		"TW_EOD_PATCH_ROWS": "239",
+		"TW_429_BLOCK_SEC": "60",
+		"TW_EOD_L1_SEC": "60"
 	}
 }

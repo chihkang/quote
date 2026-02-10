@@ -43,7 +43,7 @@ describe('API TTL fields', () => {
     });
 
     const response = await worker.fetch(request, env);
-    const json = await response.json();
+    const json = (await response.json()) as any;
 
     expect(json.results[0].ttlHardSec).toBe(ttlHardSec);
     expect(json.results[0].expiresAt).toBe(expiresAt);
