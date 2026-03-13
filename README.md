@@ -294,18 +294,16 @@ Environment variables are defined in [wrangler.jsonc](wrangler.jsonc). Key setti
 - `MAX_SYMBOLS_PER_REQUEST`: Max symbols per request.
 - `MAX_SYNC_FETCH`: Max cache misses to fetch from Fugle per request.
 - `TW_OPEN` / `TW_CLOSE`: TW trading session window (Asia/Taipei).
-- `US_OPEN` / `US_CLOSE`: US trading session window (Asia/Taipei).
-	- **Manual DST switch (Asia/Taipei)**:
-	- **Winter (EST)**: `22:30–05:00`
-	- **Summer (EDT)**: `21:30–04:00`
-	- Update `US_OPEN`/`US_CLOSE` in `wrangler.jsonc` (vars) or Cloudflare Dashboard Worker env, then redeploy/apply.
-	- TTL uses `US_OPEN/US_CLOSE` to decide trading vs off-hours. If set incorrectly, off-hours quotes can be treated as trading (TTL capped at 300s).
-	- If you see `expiresAt` only +5 minutes, it usually means `US_OPEN/US_CLOSE` is still set to trading hours.
-- `US_HOLIDAYS`: Optional comma-separated `YYYY-MM-DD` dates treated as US market holidays (Asia/Taipei calendar date).
+- US trading session is computed automatically from `America/New_York` market hours (`09:30-16:00` local time).
+	- DST switches automatically between EST and EDT; no manual seasonal config is needed.
+	- TTL uses the New York trading session to decide trading vs off-hours.
+	- If you see `expiresAt` only `+5 minutes`, the quote was classified inside the US trading session.
+- `US_HOLIDAYS`: Optional comma-separated `YYYY-MM-DD` dates treated as US market holidays in the `America/New_York` calendar.
 - `SOFT_TTL_TRADING_SEC` / `HARD_TTL_TRADING_SEC`: TTL during trading hours.
 - `SOFT_TTL_OFFHOURS_SEC`: Soft TTL outside trading hours.
 - `HARD_TTL_OFFHOURS_SEC`: Legacy fallback (not used for TW/US dynamic off-hours TTLs).
 - `OFFHOURS_OPEN_BUFFER_SEC`: Buffer seconds added to next market open time for off-hours hard TTL (default 300).
+- Invalid or negative numeric TTL/buffer env values automatically fall back to safe defaults instead of producing negative or `NaN` cache windows.
 - `L1_TTL_SEC`: In-memory cache TTL (seconds).
 - `TWSE_EOD_URL`: TWSE full-market close CSV URL.
 - `TPEX_EOD_URL`: Primary TPEX daily close source URL (default: OpenAPI `https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes`).

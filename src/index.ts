@@ -25,8 +25,6 @@ export type Env = {
 	MAX_SYMBOLS_PER_REQUEST?: string;
 	TW_OPEN?: string;
 	TW_CLOSE?: string;
-	US_OPEN?: string;
-	US_CLOSE?: string;
 	US_HOLIDAYS?: string;
 	SOFT_TTL_TRADING_SEC?: string;
 	HARD_TTL_TRADING_SEC?: string;

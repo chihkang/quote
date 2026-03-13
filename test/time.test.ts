@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { isTradingSessionTWParts, secondsUntilNextTwOpen } from '../src/time';
+import {
+  isTradingSessionTWParts,
+  isTradingSessionUS,
+  secondsUntilNextUsOpen,
+  secondsUntilNextTwOpen
+} from '../src/time';
 
 const OPEN = '09:00';
 const CLOSE = '13:30';
@@ -45,5 +50,21 @@ describe('secondsUntilNextTwOpen', () => {
   it('returns seconds until Monday open on Saturday', () => {
     const seconds = secondsUntilNextTwOpen(new Date('2026-01-31T00:00:00Z'));
     expect(seconds).toBe(176400);
+  });
+});
+
+describe('isTradingSessionUS defaults', () => {
+  it('treats 21:00 Taipei time as pre-market during daylight saving time', () => {
+    expect(isTradingSessionUS(new Date('2026-03-09T13:00:00Z'))).toBe(false);
+  });
+
+  it('treats 22:00 Taipei time as pre-market during standard time', () => {
+    expect(isTradingSessionUS(new Date('2026-12-01T14:00:00Z'))).toBe(false);
+  });
+});
+
+describe('secondsUntilNextUsOpen', () => {
+  it('returns 30 minutes until the winter open', () => {
+    expect(secondsUntilNextUsOpen(new Date('2026-12-01T14:00:00Z'))).toBe(1800);
   });
 });

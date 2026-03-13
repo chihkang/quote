@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 
 vi.mock('../src/time', () => ({
+  DEFAULT_TW_OPEN: '09:00',
+  DEFAULT_TW_CLOSE: '13:30',
   isTradingSessionTW: vi.fn(),
   secondsUntilNextTwOpen: vi.fn(),
   isTradingSessionUS: vi.fn(),
@@ -53,7 +55,7 @@ describe('getTtlSeconds', () => {
     });
 
     expect(ttl).toEqual({ soft: 1000, hard: 7380 });
-    expect(secondsUntilNextUsOpen).toHaveBeenCalledWith(expect.any(Date), '10:30', '', 180);
+    expect(secondsUntilNextUsOpen).toHaveBeenCalledWith(expect.any(Date), '', 180);
   });
 
   it('uses default open buffer when env is missing', () => {
@@ -65,7 +67,7 @@ describe('getTtlSeconds', () => {
     });
 
     expect(ttl).toEqual({ soft: 1000, hard: 2000 });
-    expect(secondsUntilNextUsOpen).toHaveBeenCalledWith(expect.any(Date), '10:30', '', 300);
+    expect(secondsUntilNextUsOpen).toHaveBeenCalledWith(expect.any(Date), '', 300);
   });
 
   it('falls back to defaults when env values are missing', () => {
@@ -74,5 +76,27 @@ describe('getTtlSeconds', () => {
     const ttl = getTtlSeconds('TW', new Date('2026-01-26T02:00:00Z'), {});
 
     expect(ttl).toEqual({ soft: 300, hard: 300 });
+  });
+
+  it('falls back to default trading ttl when configured values are invalid', () => {
+    vi.mocked(isTradingSessionTW).mockReturnValue(true);
+
+    const ttl = getTtlSeconds('TW', new Date('2026-01-26T02:00:00Z'), {
+      SOFT_TTL_TRADING_SEC: '-120',
+      HARD_TTL_TRADING_SEC: 'oops'
+    });
+
+    expect(ttl).toEqual({ soft: 300, hard: 300 });
+  });
+
+  it('falls back to default offhours soft ttl when configured value is negative', () => {
+    vi.mocked(isTradingSessionUS).mockReturnValue(false);
+    vi.mocked(secondsUntilNextUsOpen).mockReturnValue(2000);
+
+    const ttl = getTtlSeconds('US', new Date('2026-01-26T02:00:00Z'), {
+      SOFT_TTL_OFFHOURS_SEC: '-100'
+    });
+
+    expect(ttl).toEqual({ soft: 300, hard: 2000 });
   });
 });
