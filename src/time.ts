@@ -185,6 +185,10 @@ export function getTaipeiDateISO(date = new Date()): string {
   return getDateIso(date, TAIPEI_TIME_ZONE);
 }
 
+export function getNewYorkDateISO(date = new Date()): string {
+  return getDateIso(date, NEW_YORK_TIME_ZONE);
+}
+
 export function parseHolidayList(value?: string): Set<string> {
   if (!value) return new Set();
   const items = value

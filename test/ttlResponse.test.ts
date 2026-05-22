@@ -1,9 +1,16 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import worker from '../src/index';
 import { l1Clear } from '../src/l1Cache';
 
 describe('API TTL fields', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    l1Clear();
+  });
+
   it('returns ttlHardSec and expiresAt from cached value', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-02-10T02:00:00.000Z')); // 10:00 Asia/Taipei
     l1Clear();
 
     const now = new Date();

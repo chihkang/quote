@@ -10,7 +10,8 @@ Cloudflare Worker that serves batch TW and US stock quotes via Fugle (TW) and Fi
 - Stores separate TWSE/TPEX end-of-day snapshots in Cloudflare R2.
 - Applies soft/hard TTL policies that change during TW trading hours.
 - Fetches TW quotes from Fugle API and US quotes from Finnhub API with a concurrency limit of 5 for US requests.
-- During TW off-hours, serves TW quotes from EOD snapshots (query order: TWSE first, then TPEX) instead of calling Fugle.
+- After TW regular session close, resolves close semantics in two stages: current-day official EOD first, then same-day Fugle provisional close, then unavailable.
+- Before TW close during TW off-hours, serves TW quotes from latest EOD snapshots (query order: TWSE first, then TPEX) instead of calling Fugle.
 - During TW trading hours, if Fugle returns `429`, temporarily blocks Fugle calls and falls back to EOD snapshots (TWSE first, then TPEX).
 
 ## Why the project is useful
@@ -104,7 +105,10 @@ Response:
 			"expiresAt": "2026-01-26T00:05:01.000Z",
 			"status": "fresh",
 			"isStale": false,
-			"reason": null
+			"reason": null,
+			"closeKind": "intraday",
+			"sourceTradingDate": "2026-01-26",
+			"targetTradingDate": "2026-01-26"
 		}
 	]
 }
@@ -125,7 +129,10 @@ Response:
 - `expiresAt`: Cache expiry time (ISO) derived from `fetchedAt + ttlHardSec`.
 - `status`: `fresh`, `stale`, or `missing`.
 - `isStale`: Whether the value exceeded the soft TTL.
-- `reason`: One of `KV_MISS`, `HARD_EXPIRED`, `FUGLE_ERROR`, `FINNHUB_ERROR`, `TW_EOD_OFFHOURS`, `TW_EOD_FALLBACK_429`, `TW_EOD_MISS`, or `null`.
+- `reason`: One of `KV_MISS`, `HARD_EXPIRED`, `FUGLE_ERROR`, `FINNHUB_ERROR`, `TW_EOD_OFFHOURS`, `TW_EOD_FALLBACK_429`, `TW_EOD_MISS`, `TW_EOD_NOT_READY`, `TW_EOD_NOT_CONFIGURED`, `TW_PROVISIONAL_UNAVAILABLE`, `TW_PROVISIONAL_SOURCE_DATE_MISMATCH`, or `null`.
+- `closeKind`: Price semantics: `intraday`, `provisional`, `official_eod`, or `unavailable`.
+- `sourceTradingDate`: Market-local trading date represented by the source data, or `null` when unavailable. TW uses Taipei date; US intraday quotes use New York date.
+- `targetTradingDate`: Market-local trading date the response is resolving for. Consumers should compare this with `sourceTradingDate` before settlement/reconcile.
 
 ### Curl example
 
@@ -216,16 +223,33 @@ sequenceDiagram
     end
 ```
 
-#### TW market in off-hours
+#### TW market after regular close
 
-- Off-hours means outside `TW_OPEN-TW_CLOSE`.
-- If `TW_EOD_R2` is configured, TW symbols bypass L1/KV/Fugle and directly use R2 EOD chain:
+- Regular close starts after `TW_CLOSE` (default `13:30`, Asia/Taipei). At `13:30` itself, the quote is still treated as intraday.
+- Close resolution bypasses ordinary quote L1/KV first, so earlier intraday/provisional cache entries cannot hide a current-day official EOD close.
+- Lookup order:
+	- Current-day R2 EOD chain (`TWSE -> TPEX`) when `TW_EOD_R2` is configured.
+	- Fugle quote as a same-day provisional close when current-day official EOD is not ready.
+	- Explicit unavailable close when neither current-day official EOD nor same-day Fugle data is usable.
+- Fugle provisional validation:
+	- If Fugle supplies `asOf`, its Taipei trading date must match `targetTradingDate`.
+	- If Fugle omits `asOf`, Worker may infer `sourceTradingDate` from `fetchedAt` when the fetch succeeds after TW close on the target date. The response keeps both `asOf` and `fetchedAt`.
+	- If Fugle returns an older source date, an unparseable timestamp, or no usable price, Worker returns `price=null`, `closeKind=unavailable`.
+- Typical response mapping:
+	- Current-day EOD hit: `status=fresh`, `reason=TW_EOD_OFFHOURS`, `closeKind=official_eod`
+	- Same-day Fugle provisional hit: `status=fresh`, `reason=null`, `closeKind=provisional`
+	- EOD not ready and no usable provisional: `status=missing`, `reason` is `TW_EOD_NOT_READY`, `TW_PROVISIONAL_UNAVAILABLE`, or `TW_PROVISIONAL_SOURCE_DATE_MISMATCH`, `closeKind=unavailable`
+
+#### TW market before regular close but outside the session
+
+- This preserves the previous latest-EOD display behavior for pre-open and other non-close-resolution windows.
+- If `TW_EOD_R2` is configured, TW symbols use the latest R2 EOD chain:
 	- `twse/eod/latest.json` first
 	- then `tpex/eod/latest.json`
 - If `TW_EOD_R2` is not configured, Worker falls back to normal L1/KV/API flow.
 - Typical response mapping:
-	- EOD hit: `status=fresh`, `reason=TW_EOD_OFFHOURS`
-	- EOD miss: `status=missing`, `reason=TW_EOD_MISS`
+	- EOD hit: `status=fresh`, `reason=TW_EOD_OFFHOURS`, `closeKind=official_eod`
+	- EOD miss: `status=missing`, `reason=TW_EOD_MISS`, `closeKind=unavailable`
 
 #### US market in trading session and off-hours
 

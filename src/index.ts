@@ -2,7 +2,13 @@ import { l1Get, l1Set } from './l1Cache';
 import { getQuote, putQuote, type QuoteCacheValue } from './kvCache';
 import { classify, isStale } from './quotePolicy';
 import { normalizeSymbols, type NormalizedSymbol } from './symbols';
-import { getTaipeiParts, isTradingSessionTW } from './time';
+import {
+	getNewYorkDateISO,
+	getTaipeiDateISO,
+	getTaipeiParts,
+	isTradingSessionTW,
+	parseTimeHHMM
+} from './time';
 import { getTtlSeconds } from './ttl';
 import {
 	getLatestTpexEodSnapshot,
@@ -39,6 +45,10 @@ export type Env = {
 	TW_EOD_L1_SEC?: string;
 };
 
+type CloseKind = 'intraday' | 'provisional' | 'official_eod' | 'unavailable';
+type QuoteStatus = 'fresh' | 'stale' | 'missing';
+type TwEodHitReason = 'TW_EOD_OFFHOURS' | 'TW_EOD_FALLBACK_429';
+
 type QuoteResult = {
 	symbol: string;
 	canonicalSymbol: string;
@@ -49,9 +59,19 @@ type QuoteResult = {
 	fetchedAt: string | null;
 	ttlHardSec: number | null;
 	expiresAt: string | null;
-	status: 'fresh' | 'stale' | 'missing';
+	status: QuoteStatus;
 	isStale: boolean;
 	reason: string | null;
+	closeKind: CloseKind;
+	sourceTradingDate: string | null;
+	targetTradingDate: string;
+};
+
+type ExtractedQuote = {
+	price: number | null;
+	currency: string | null;
+	asOf: string | null;
+	hasExplicitAsOf: boolean;
 };
 
 class HttpStatusError extends Error {
@@ -117,7 +137,49 @@ function eodAsOf(tradingDate: string): string | null {
 	return iso.toISOString();
 }
 
-function extractQuote(data: any): { price: number | null; currency: string | null; asOf: string | null } {
+function parseDate(value: string | null | undefined): Date | null {
+	if (!value) return null;
+	const date = new Date(value);
+	return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function getMarketDateISO(market: 'TW' | 'US', date: Date): string {
+	return market === 'US' ? getNewYorkDateISO(date) : getTaipeiDateISO(date);
+}
+
+function getSourceTradingDate(
+	market: 'TW' | 'US',
+	asOf: string | null | undefined,
+	fetchedAt: string | null | undefined
+): string | null {
+	const sourceDate = parseDate(asOf) ?? parseDate(fetchedAt);
+	return sourceDate ? getMarketDateISO(market, sourceDate) : null;
+}
+
+function getProvisionalSourceTradingDate(
+	asOf: string | null,
+	fetchedAt: string,
+	hasExplicitAsOf: boolean
+): string | null {
+	const explicitAsOf = parseDate(asOf);
+	if (hasExplicitAsOf) {
+		return explicitAsOf ? getTaipeiDateISO(explicitAsOf) : null;
+	}
+
+	const fetchedAtDate = parseDate(fetchedAt);
+	return fetchedAtDate ? getTaipeiDateISO(fetchedAtDate) : null;
+}
+
+function isAfterTwRegularClose(now: Date, close: string): boolean {
+	const parts = getTaipeiParts(now);
+	if (parts.weekday < 1 || parts.weekday > 5) return false;
+	const closeParts = parseTimeHHMM(close);
+	const nowMinutes = parts.hour * 60 + parts.minute;
+	const closeMinutes = closeParts.hour * 60 + closeParts.minute;
+	return nowMinutes > closeMinutes;
+}
+
+function extractQuote(data: any): ExtractedQuote {
 	const priceCandidates = [
 		data?.lastPrice,
 		data?.closePrice,
@@ -155,6 +217,7 @@ function extractQuote(data: any): { price: number | null; currency: string | nul
 		data?.data?.quote?.time ??
 		data?.data?.time ??
 		null;
+	const hasExplicitAsOf = asOfRaw !== null && asOfRaw !== undefined && asOfRaw !== '';
 
 	let asOf: string | null = null;
 	if (typeof asOfRaw === 'string' && asOfRaw) {
@@ -165,7 +228,7 @@ function extractQuote(data: any): { price: number | null; currency: string | nul
 	} else if (typeof asOfRaw === 'number' && Number.isFinite(asOfRaw)) {
 		asOf = toIsoFromEpoch(asOfRaw);
 	}
-	return { price, currency, asOf };
+	return { price, currency, asOf, hasExplicitAsOf };
 }
 
 async function fetchFugleQuote(symbol: string, env: Env) {
@@ -216,7 +279,8 @@ async function buildFromCache(
 	ttlHard: number,
 	l1TtlSec: number,
 	normalized: NormalizedSymbol,
-	cached: QuoteCacheValue
+	cached: QuoteCacheValue,
+	targetTradingDate: string
 ): Promise<QuoteResult> {
 	const parsedFetchedAt = Date.parse(cached.fetchedAt);
 	const fetchedAtMs = Number.isFinite(parsedFetchedAt) ? parsedFetchedAt : 0;
@@ -234,14 +298,21 @@ async function buildFromCache(
 		expiresAt: cached.expiresAt ?? null,
 		status,
 		isStale: isStale(status),
-		reason: status === 'missing' ? 'HARD_EXPIRED' : null
+		reason: status === 'missing' ? 'HARD_EXPIRED' : null,
+		closeKind: 'intraday',
+		sourceTradingDate: getSourceTradingDate(normalized.market, cached.asOf, cached.fetchedAt),
+		targetTradingDate
 	};
 
 	l1Set(normalized.kvKey, result, l1TtlSec, nowMs);
 	return result;
 }
 
-async function buildMissing(normalized: NormalizedSymbol, reason: string): Promise<QuoteResult> {
+async function buildMissing(
+	normalized: NormalizedSymbol,
+	reason: string,
+	targetTradingDate: string
+): Promise<QuoteResult> {
 	return {
 		symbol: normalized.originalSymbol,
 		canonicalSymbol: normalized.canonicalSymbol,
@@ -254,15 +325,19 @@ async function buildMissing(normalized: NormalizedSymbol, reason: string): Promi
 		expiresAt: null,
 		status: 'missing',
 		isStale: false,
-		reason
+		reason,
+		closeKind: 'unavailable',
+		sourceTradingDate: null,
+		targetTradingDate
 	};
 }
 
 function buildFromTwEod(
 	normalized: NormalizedSymbol,
 	snapshot: TwEodSnapshot | null,
-	hitReason: 'TW_EOD_OFFHOURS' | 'TW_EOD_FALLBACK_429',
-	hitStatus: 'fresh' | 'stale'
+	hitReason: TwEodHitReason,
+	hitStatus: Exclude<QuoteStatus, 'missing'>,
+	targetTradingDate: string
 ): QuoteResult {
 	const quote = getTwEodQuote(snapshot, normalized.ticker);
 	if (!snapshot || !quote || quote.close === null) {
@@ -278,7 +353,10 @@ function buildFromTwEod(
 			expiresAt: null,
 			status: 'missing',
 			isStale: false,
-			reason: 'TW_EOD_MISS'
+			reason: 'TW_EOD_MISS',
+			closeKind: 'unavailable',
+			sourceTradingDate: null,
+			targetTradingDate
 		};
 	}
 
@@ -294,7 +372,10 @@ function buildFromTwEod(
 		expiresAt: null,
 		status: hitStatus,
 		isStale: hitStatus === 'stale',
-		reason: hitReason
+		reason: hitReason,
+		closeKind: 'official_eod',
+		sourceTradingDate: snapshot.tradingDate,
+		targetTradingDate
 	};
 }
 
@@ -307,6 +388,32 @@ function computeExpiresAt(fetchedAt: string, hardTtlSec: number): string {
 	const parsedStoredAt = Date.parse(fetchedAt);
 	const storedAtMs = Number.isFinite(parsedStoredAt) ? parsedStoredAt : Date.now();
 	return new Date(storedAtMs + safeHard * 1000).toISOString();
+}
+
+function buildFreshQuoteResult(
+	normalized: NormalizedSymbol,
+	cacheValue: QuoteCacheValue,
+	closeKind: Extract<CloseKind, 'intraday' | 'provisional'>,
+	sourceTradingDate: string | null,
+	targetTradingDate: string
+): QuoteResult {
+	return {
+		symbol: normalized.originalSymbol,
+		canonicalSymbol: normalized.canonicalSymbol,
+		market: normalized.market,
+		price: cacheValue.price,
+		currency: cacheValue.currency,
+		asOf: cacheValue.asOf,
+		fetchedAt: cacheValue.fetchedAt,
+		ttlHardSec: cacheValue.ttlHardSec ?? null,
+		expiresAt: cacheValue.expiresAt ?? null,
+		status: 'fresh',
+		isStale: false,
+		reason: null,
+		closeKind,
+		sourceTradingDate,
+		targetTradingDate
+	};
 }
 
 function isRateLimited(error: unknown): boolean {
@@ -476,12 +583,20 @@ export default {
 
 		const now = new Date();
 		const nowMs = now.getTime();
-		const twTrading = isTradingSessionTW(now, env.TW_OPEN ?? '09:00', env.TW_CLOSE ?? '13:30');
+		const twClose = env.TW_CLOSE ?? '13:30';
+		const twTrading = isTradingSessionTW(now, env.TW_OPEN ?? '09:00', twClose);
+		const twPostClose = isAfterTwRegularClose(now, twClose);
 		const l1TtlSec = toNumber(env.L1_TTL_SEC, 20);
 		const maxSyncFetch = toNumber(env.MAX_SYNC_FETCH, 10);
 
 		const results: QuoteResult[] = new Array(normalizedList.length);
-		const missingForFetch: Array<{ index: number; item: NormalizedSymbol; reason: string }> = [];
+		const missingForFetch: Array<{
+			index: number;
+			item: NormalizedSymbol;
+			reason: string;
+			targetTradingDate: string;
+			closeResolution: boolean;
+		}> = [];
 		let twseSnapshot: TwEodSnapshot | null | undefined = undefined;
 		let tpexSnapshot: TwEodSnapshot | null | undefined = undefined;
 
@@ -501,20 +616,29 @@ export default {
 
 		const buildFromTwEodChain = async (
 			item: NormalizedSymbol,
-			hitReason: 'TW_EOD_OFFHOURS' | 'TW_EOD_FALLBACK_429',
-			hitStatus: 'fresh' | 'stale'
+			hitReason: TwEodHitReason,
+			hitStatus: Exclude<QuoteStatus, 'missing'>,
+			targetTradingDate: string,
+			requireTradingDate?: string
 		): Promise<QuoteResult> => {
 			const twse = await getTwseSnapshot();
-			const twseQuote = getTwEodQuote(twse, item.ticker);
-			if (twse && twseQuote && twseQuote.close !== null) {
-				return buildFromTwEod(item, twse, hitReason, hitStatus);
+			const twseReady = !requireTradingDate || twse?.tradingDate === requireTradingDate;
+			const twseQuote = twseReady ? getTwEodQuote(twse, item.ticker) : null;
+			if (twse && twseReady && twseQuote && twseQuote.close !== null) {
+				return buildFromTwEod(item, twse, hitReason, hitStatus, targetTradingDate);
 			}
 
 			const tpex = await getTpexSnapshot();
-			const tpexQuote = getTwEodQuote(tpex, item.ticker);
-			if (tpex && tpexQuote && tpexQuote.close !== null) {
-				return buildFromTwEod(item, tpex, hitReason, hitStatus);
+			const tpexReady = !requireTradingDate || tpex?.tradingDate === requireTradingDate;
+			const tpexQuote = tpexReady ? getTwEodQuote(tpex, item.ticker) : null;
+			if (tpex && tpexReady && tpexQuote && tpexQuote.close !== null) {
+				return buildFromTwEod(item, tpex, hitReason, hitStatus, targetTradingDate);
 			}
+
+			const reason =
+				requireTradingDate && (twse?.tradingDate !== requireTradingDate || tpex?.tradingDate !== requireTradingDate)
+					? 'TW_EOD_NOT_READY'
+					: 'TW_EOD_MISS';
 
 			return {
 				symbol: item.originalSymbol,
@@ -528,16 +652,47 @@ export default {
 				expiresAt: null,
 				status: 'missing',
 				isStale: false,
-				reason: 'TW_EOD_MISS'
+				reason,
+				closeKind: 'unavailable',
+				sourceTradingDate: null,
+				targetTradingDate
 			};
 		};
 
 		for (let i = 0; i < normalizedList.length; i += 1) {
 			const item = normalizedList[i];
+			const targetTradingDate = getMarketDateISO(item.market, now);
 
-			// Outside TW trading hours, prefer TWSE first and then TPEX EOD snapshots.
+			if (item.market === 'TW' && twPostClose) {
+				const eodResult = env.TW_EOD_R2
+					? await buildFromTwEodChain(
+							item,
+							'TW_EOD_OFFHOURS',
+							'fresh',
+							targetTradingDate,
+							targetTradingDate
+						)
+					: await buildMissing(item, 'TW_EOD_NOT_CONFIGURED', targetTradingDate);
+				if (eodResult.closeKind === 'official_eod') {
+					l1Set(item.kvKey, eodResult, l1TtlSec, nowMs);
+					results[i] = eodResult;
+					continue;
+				}
+
+				results[i] = eodResult;
+				missingForFetch.push({
+					index: i,
+					item,
+					reason: eodResult.reason ?? 'TW_EOD_NOT_READY',
+					targetTradingDate,
+					closeResolution: true
+				});
+				continue;
+			}
+
+			// Outside TW trading hours before close resolution, preserve the existing latest-EOD fallback.
 			if (item.market === 'TW' && !twTrading && env.TW_EOD_R2) {
-				const eodResult = await buildFromTwEodChain(item, 'TW_EOD_OFFHOURS', 'fresh');
+				const eodResult = await buildFromTwEodChain(item, 'TW_EOD_OFFHOURS', 'fresh', targetTradingDate);
 				if (eodResult.reason !== 'TW_EOD_MISS') {
 					l1Set(item.kvKey, eodResult, l1TtlSec, nowMs);
 				}
@@ -553,17 +708,37 @@ export default {
 
 			const cached = await getQuote(env, item.kvKey);
 			if (!cached) {
-				results[i] = await buildMissing(item, 'KV_MISS');
-				missingForFetch.push({ index: i, item, reason: 'KV_MISS' });
+				results[i] = await buildMissing(item, 'KV_MISS', targetTradingDate);
+				missingForFetch.push({
+					index: i,
+					item,
+					reason: 'KV_MISS',
+					targetTradingDate,
+					closeResolution: false
+				});
 				continue;
 			}
 
 			const ttl = getTtlSeconds(item.market, now, env);
-			const cachedResult = await buildFromCache(nowMs, ttl.soft, ttl.hard, l1TtlSec, item, cached);
+			const cachedResult = await buildFromCache(
+				nowMs,
+				ttl.soft,
+				ttl.hard,
+				l1TtlSec,
+				item,
+				cached,
+				targetTradingDate
+			);
 
 			if (cachedResult.status === 'missing') {
 				results[i] = { ...cachedResult, reason: 'HARD_EXPIRED' };
-				missingForFetch.push({ index: i, item, reason: 'HARD_EXPIRED' });
+				missingForFetch.push({
+					index: i,
+					item,
+					reason: 'HARD_EXPIRED',
+					targetTradingDate,
+					closeResolution: false
+				});
 				continue;
 			}
 
@@ -582,22 +757,41 @@ export default {
 				twRateLimited = blockedUntilMs !== null && blockedUntilMs > nowMs;
 			}
 
-			for (const { index, item } of twTargets) {
+			for (const { index, item, targetTradingDate, closeResolution } of twTargets) {
 				if (twRateLimited) {
-					results[index] = await buildFromTwEodChain(item, 'TW_EOD_FALLBACK_429', 'stale');
+					results[index] = await buildFromTwEodChain(
+						item,
+						'TW_EOD_FALLBACK_429',
+						'stale',
+						targetTradingDate
+					);
 					continue;
 				}
 
-				try {
-					const fetchedAt = new Date().toISOString();
-					const { price, currency, asOf } = await fetchFugleQuote(item.ticker, env);
+					try {
+						const fetchedAt = new Date().toISOString();
+						const { price, currency, asOf, hasExplicitAsOf } = await fetchFugleQuote(item.ticker, env);
 
 					if (price === null) {
 						console.warn('Fugle quote missing price', { symbol: item.ticker });
-						results[index] = {
-							...results[index],
-							reason: 'FUGLE_ERROR'
-						};
+						results[index] = closeResolution
+							? await buildMissing(item, 'TW_PROVISIONAL_UNAVAILABLE', targetTradingDate)
+							: {
+									...results[index],
+									reason: 'FUGLE_ERROR'
+								};
+						continue;
+					}
+
+					const sourceTradingDate = closeResolution
+						? getProvisionalSourceTradingDate(asOf, fetchedAt, hasExplicitAsOf)
+						: getSourceTradingDate(item.market, asOf, fetchedAt);
+					if (closeResolution && sourceTradingDate !== targetTradingDate) {
+						results[index] = await buildMissing(
+							item,
+							'TW_PROVISIONAL_SOURCE_DATE_MISMATCH',
+							targetTradingDate
+						);
 						continue;
 					}
 
@@ -608,7 +802,7 @@ export default {
 						market: item.market,
 						price,
 						currency,
-						asOf: asOf ?? fetchedAt,
+						asOf: closeResolution ? asOf : asOf ?? fetchedAt,
 						fetchedAt,
 						ttlHardSec: ttl.hard,
 						expiresAt: computeExpiresAt(fetchedAt, ttl.hard),
@@ -617,20 +811,13 @@ export default {
 
 					await putQuote(env, item.kvKey, cacheValue, ttl.hard);
 
-					const freshResult: QuoteResult = {
-						symbol: item.originalSymbol,
-						canonicalSymbol: item.canonicalSymbol,
-						market: item.market,
-						price: cacheValue.price,
-						currency: cacheValue.currency,
-						asOf: cacheValue.asOf,
-						fetchedAt: cacheValue.fetchedAt,
-						ttlHardSec: cacheValue.ttlHardSec ?? null,
-						expiresAt: cacheValue.expiresAt ?? null,
-						status: 'fresh',
-						isStale: false,
-						reason: null
-					};
+					const freshResult = buildFreshQuoteResult(
+						item,
+						cacheValue,
+						closeResolution ? 'provisional' : 'intraday',
+						sourceTradingDate,
+						targetTradingDate
+					);
 
 					l1Set(item.kvKey, freshResult, l1TtlSec);
 					results[index] = freshResult;
@@ -638,15 +825,19 @@ export default {
 					if (isRateLimited(error)) {
 						twRateLimited = true;
 						await setTwFugleBlockUntilMs(env, Date.now(), toNumber(env.TW_429_BLOCK_SEC, 60));
-						results[index] = await buildFromTwEodChain(item, 'TW_EOD_FALLBACK_429', 'stale');
+						results[index] = closeResolution
+							? await buildMissing(item, 'TW_PROVISIONAL_UNAVAILABLE', targetTradingDate)
+							: await buildFromTwEodChain(item, 'TW_EOD_FALLBACK_429', 'stale', targetTradingDate);
 						continue;
 					}
 
 					console.error('Fugle quote failed', { symbol: item.ticker, error });
-					results[index] = {
-						...results[index],
-						reason: 'FUGLE_ERROR'
-					};
+					results[index] = closeResolution
+						? await buildMissing(item, 'TW_PROVISIONAL_UNAVAILABLE', targetTradingDate)
+						: {
+								...results[index],
+								reason: 'FUGLE_ERROR'
+							};
 				}
 			}
 
@@ -654,7 +845,7 @@ export default {
 			for (let i = 0; i < usTargets.length; i += concurrencyLimit) {
 				const batch = usTargets.slice(i, i + concurrencyLimit);
 				await Promise.all(
-					batch.map(async ({ index, item }) => {
+					batch.map(async ({ index, item, targetTradingDate }) => {
 						try {
 							const fetchedAt = new Date().toISOString();
 							const { price, currency, asOf } = await fetchFinnhubQuote(item.ticker, env);
@@ -684,20 +875,13 @@ export default {
 
 							await putQuote(env, item.kvKey, cacheValue, ttl.hard);
 
-							const freshResult: QuoteResult = {
-								symbol: item.originalSymbol,
-								canonicalSymbol: item.canonicalSymbol,
-								market: item.market,
-								price: cacheValue.price,
-								currency: cacheValue.currency,
-								asOf: cacheValue.asOf,
-								fetchedAt: cacheValue.fetchedAt,
-								ttlHardSec: cacheValue.ttlHardSec ?? null,
-								expiresAt: cacheValue.expiresAt ?? null,
-								status: 'fresh',
-								isStale: false,
-								reason: null
-							};
+							const freshResult = buildFreshQuoteResult(
+								item,
+								cacheValue,
+								'intraday',
+								getSourceTradingDate(item.market, cacheValue.asOf, cacheValue.fetchedAt),
+								targetTradingDate
+							);
 
 							l1Set(item.kvKey, freshResult, l1TtlSec);
 							results[index] = freshResult;

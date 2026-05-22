@@ -121,6 +121,268 @@ describe('TW EOD fallback behavior', () => {
 		expect(json.results[0].reason).toBe('TW_EOD_OFFHOURS');
 	});
 
+	it('returns official EOD close after close even when quote cache has an earlier value', async () => {
+		vi.setSystemTime(new Date('2026-02-10T06:00:00.000Z')); // 14:00 Asia/Taipei
+		const kv = createKv({
+			'quote:TW:2330': JSON.stringify({
+				symbol: '2330',
+				canonicalSymbol: '2330.TW',
+				market: 'TW',
+				price: 1090,
+				currency: 'TWD',
+				asOf: '2026-02-10T05:29:00.000Z',
+				fetchedAt: '2026-02-10T05:29:05.000Z',
+				ttlHardSec: 300,
+				expiresAt: '2026-02-10T05:34:05.000Z',
+				softTtlJitterSec: 0
+			})
+		});
+		const r2 = createR2({
+			[TWSE_EOD_LATEST_KEY]: JSON.stringify(buildTwEodSnapshot())
+		});
+
+		const fetchMock = vi.fn();
+		vi.stubGlobal('fetch', fetchMock);
+
+		const response = await callTwBatch(makeEnv({ kv, r2 }), ['2330']);
+		const json = (await response.json()) as any;
+
+		expect(fetchMock).not.toHaveBeenCalled();
+		expect(json.results[0].price).toBe(1080);
+		expect(json.results[0].closeKind).toBe('official_eod');
+		expect(json.results[0].sourceTradingDate).toBe('2026-02-10');
+		expect(json.results[0].targetTradingDate).toBe('2026-02-10');
+	});
+
+	it('returns official EOD close after close even when quote L1 has an earlier intraday value', async () => {
+		vi.setSystemTime(new Date('2026-02-10T05:29:00.000Z')); // 13:29 Asia/Taipei
+		const kv = createKv();
+		const r2 = createR2({
+			[TWSE_EOD_LATEST_KEY]: JSON.stringify(buildTwEodSnapshot())
+		});
+		const env = makeEnv({
+			kv,
+			r2,
+			overrides: {
+				L1_TTL_SEC: '3600'
+			}
+		});
+
+		const fetchMock = vi.fn(async () =>
+			new Response(
+				JSON.stringify({
+					lastPrice: 1090,
+					lastUpdated: '2026-02-10T05:29:00.000Z'
+				}),
+				{
+					status: 200,
+					headers: { 'Content-Type': 'application/json' }
+				}
+			)
+		);
+		vi.stubGlobal('fetch', fetchMock);
+
+		const intradayResponse = await callTwBatch(env, ['2330']);
+		const intradayJson = (await intradayResponse.json()) as any;
+		expect(intradayJson.results[0].price).toBe(1090);
+		expect(intradayJson.results[0].closeKind).toBe('intraday');
+
+		vi.setSystemTime(new Date('2026-02-10T06:00:00.000Z')); // 14:00 Asia/Taipei
+		const closeResponse = await callTwBatch(env, ['2330']);
+		const closeJson = (await closeResponse.json()) as any;
+
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+		expect(closeJson.results[0].price).toBe(1080);
+		expect(closeJson.results[0].closeKind).toBe('official_eod');
+		expect(closeJson.results[0].sourceTradingDate).toBe('2026-02-10');
+		expect(closeJson.results[0].targetTradingDate).toBe('2026-02-10');
+	});
+
+	it('uses a same-day Fugle quote as provisional close when today EOD is not ready after close', async () => {
+		vi.setSystemTime(new Date('2026-02-10T06:00:00.000Z')); // 14:00 Asia/Taipei
+		const kv = createKv();
+		const r2 = createR2({
+			[TWSE_EOD_LATEST_KEY]: JSON.stringify(
+				buildTwEodSnapshot({
+					tradingDate: '2026-02-09',
+					fetchedAt: '2026-02-09T06:00:00.000Z'
+				})
+			)
+		});
+
+		const fetchMock = vi.fn(async () =>
+			new Response(
+				JSON.stringify({
+					lastPrice: 1090,
+					lastUpdated: '2026-02-10T05:31:00.000Z'
+				}),
+				{
+					status: 200,
+					headers: { 'Content-Type': 'application/json' }
+				}
+			)
+		);
+		vi.stubGlobal('fetch', fetchMock);
+
+		const response = await callTwBatch(makeEnv({ kv, r2 }), ['2330']);
+		const json = (await response.json()) as any;
+
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+		expect(json.results[0].price).toBe(1090);
+		expect(json.results[0].closeKind).toBe('provisional');
+		expect(json.results[0].sourceTradingDate).toBe('2026-02-10');
+		expect(json.results[0].targetTradingDate).toBe('2026-02-10');
+	});
+
+	it('infers provisional source trading date from fetchedAt when Fugle omits asOf after close', async () => {
+		vi.setSystemTime(new Date('2026-02-10T06:00:00.000Z')); // 14:00 Asia/Taipei
+		const kv = createKv();
+		const r2 = createR2({
+			[TWSE_EOD_LATEST_KEY]: JSON.stringify(
+				buildTwEodSnapshot({
+					tradingDate: '2026-02-09',
+					fetchedAt: '2026-02-09T06:00:00.000Z'
+				})
+			)
+		});
+
+		const fetchMock = vi.fn(async () =>
+			new Response(JSON.stringify({ lastPrice: 1090 }), {
+				status: 200,
+				headers: { 'Content-Type': 'application/json' }
+			})
+		);
+		vi.stubGlobal('fetch', fetchMock);
+
+		const response = await callTwBatch(makeEnv({ kv, r2 }), ['2330']);
+		const json = (await response.json()) as any;
+
+		expect(json.results[0].price).toBe(1090);
+		expect(json.results[0].asOf).toBeNull();
+		expect(json.results[0].fetchedAt).toBe('2026-02-10T06:00:00.000Z');
+		expect(json.results[0].closeKind).toBe('provisional');
+		expect(json.results[0].sourceTradingDate).toBe('2026-02-10');
+	});
+
+	it('returns unavailable after close when Fugle quote is not from the target trading date', async () => {
+		vi.setSystemTime(new Date('2026-02-10T06:00:00.000Z')); // 14:00 Asia/Taipei
+		const kv = createKv();
+		const r2 = createR2({
+			[TWSE_EOD_LATEST_KEY]: JSON.stringify(
+				buildTwEodSnapshot({
+					tradingDate: '2026-02-09',
+					fetchedAt: '2026-02-09T06:00:00.000Z'
+				})
+			)
+		});
+
+		const fetchMock = vi.fn(async () =>
+			new Response(
+				JSON.stringify({
+					lastPrice: 1090,
+					lastUpdated: '2026-02-09T05:31:00.000Z'
+				}),
+				{
+					status: 200,
+					headers: { 'Content-Type': 'application/json' }
+				}
+			)
+		);
+		vi.stubGlobal('fetch', fetchMock);
+
+		const response = await callTwBatch(makeEnv({ kv, r2 }), ['2330']);
+		const json = (await response.json()) as any;
+
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+		expect(json.results[0].price).toBeNull();
+		expect(json.results[0].status).toBe('missing');
+		expect(json.results[0].reason).toBe('TW_PROVISIONAL_SOURCE_DATE_MISMATCH');
+		expect(json.results[0].closeKind).toBe('unavailable');
+		expect(json.results[0].sourceTradingDate).toBeNull();
+		expect(json.results[0].targetTradingDate).toBe('2026-02-10');
+	});
+
+	it('returns unavailable after close when Fugle provides an unparseable asOf timestamp', async () => {
+		vi.setSystemTime(new Date('2026-02-10T06:00:00.000Z')); // 14:00 Asia/Taipei
+		const kv = createKv();
+		const r2 = createR2({
+			[TWSE_EOD_LATEST_KEY]: JSON.stringify(
+				buildTwEodSnapshot({
+					tradingDate: '2026-02-09',
+					fetchedAt: '2026-02-09T06:00:00.000Z'
+				})
+			)
+		});
+
+		const fetchMock = vi.fn(async () =>
+			new Response(
+				JSON.stringify({
+					lastPrice: 1090,
+					lastUpdated: 'not-a-date'
+				}),
+				{
+					status: 200,
+					headers: { 'Content-Type': 'application/json' }
+				}
+			)
+		);
+		vi.stubGlobal('fetch', fetchMock);
+
+		const response = await callTwBatch(makeEnv({ kv, r2 }), ['2330']);
+		const json = (await response.json()) as any;
+
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+		expect(json.results[0].price).toBeNull();
+		expect(json.results[0].reason).toBe('TW_PROVISIONAL_SOURCE_DATE_MISMATCH');
+		expect(json.results[0].closeKind).toBe('unavailable');
+		expect(json.results[0].sourceTradingDate).toBeNull();
+		expect(json.results[0].targetTradingDate).toBe('2026-02-10');
+	});
+
+	it('keeps a stale TW cache result as intraday during the regular session', async () => {
+		vi.setSystemTime(new Date('2026-02-10T02:10:00.000Z')); // 10:10 Asia/Taipei
+		const kv = createKv({
+			'quote:TW:2330': JSON.stringify({
+				symbol: '2330',
+				canonicalSymbol: '2330.TW',
+				market: 'TW',
+				price: 1090,
+				currency: 'TWD',
+				asOf: '2026-02-10T02:00:00.000Z',
+				fetchedAt: '2026-02-10T02:00:00.000Z',
+				ttlHardSec: 3600,
+				expiresAt: '2026-02-10T03:00:00.000Z',
+				softTtlJitterSec: 0
+			})
+		});
+		const r2 = createR2({
+			[TWSE_EOD_LATEST_KEY]: JSON.stringify(buildTwEodSnapshot())
+		});
+
+		const fetchMock = vi.fn();
+		vi.stubGlobal('fetch', fetchMock);
+
+		const response = await callTwBatch(
+			makeEnv({
+				kv,
+				r2,
+				overrides: {
+					SOFT_TTL_TRADING_SEC: '1',
+					HARD_TTL_TRADING_SEC: '3600'
+				}
+			}),
+			['2330']
+		);
+		const json = (await response.json()) as any;
+
+		expect(fetchMock).not.toHaveBeenCalled();
+		expect(json.results[0].status).toBe('stale');
+		expect(json.results[0].isStale).toBe(true);
+		expect(json.results[0].closeKind).toBe('intraday');
+		expect(json.results[0].sourceTradingDate).toBe('2026-02-10');
+		expect(json.results[0].targetTradingDate).toBe('2026-02-10');
+	});
+
 	it('falls back to TW EOD on 429 and blocks further Fugle calls in same request', async () => {
 		vi.setSystemTime(new Date('2026-02-10T02:00:00.000Z')); // 10:00 Asia/Taipei
 		const kv = createKv();
