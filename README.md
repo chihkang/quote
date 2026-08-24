@@ -314,6 +314,16 @@ Environment variables are defined in [wrangler.jsonc](wrangler.jsonc). Key setti
 - **KV TTL visibility**
 	- KV values include `ttlHardSec` and `expiresAt`, so you can inspect TTLs directly in the KV UI or API responses.
 
+- **Cache lookup and upstream resilience**
+	- After L1 and TW EOD special-case checks, independent KV reads run concurrently.
+	- Concurrent requests for the same canonical symbol share one in-flight upstream fetch per Worker isolate.
+	- Fugle and Finnhub requests use a per-attempt timeout and bounded retries for network errors, `429`, and `5xx` responses.
+	- `UPSTREAM_TIMEOUT_MS`: Per-attempt timeout in milliseconds (default `3000`).
+	- `UPSTREAM_MAX_ATTEMPTS`: Total attempts including the initial request (default `3`).
+	- `UPSTREAM_RETRY_BASE_MS`: Initial exponential retry delay (default `200`).
+	- `UPSTREAM_RETRY_MAX_DELAY_MS`: Maximum delay for one retry (default `2000`).
+	- `UPSTREAM_REQUEST_DEADLINE_MS`: Total synchronous upstream budget per quote request (default `10000`); remaining symbols use the existing market-specific error/fallback semantics after the deadline.
+
 - `DEFAULT_MARKET`: Default market when symbols do not specify one.
 - `MAX_SYMBOLS_PER_REQUEST`: Max symbols per request.
 - `MAX_SYNC_FETCH`: Max cache misses to fetch from Fugle per request.

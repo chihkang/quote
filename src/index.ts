@@ -1,7 +1,13 @@
 import { l1Get, l1Set } from './l1Cache';
-import { getQuote, putQuote, type QuoteCacheValue } from './kvCache';
+import { getQuote, getQuotes, putQuote, type QuoteCacheValue } from './kvCache';
 import { classify, isStale } from './quotePolicy';
 import { normalizeSymbols, type NormalizedSymbol } from './symbols';
+import {
+	fetchWithRetry,
+	HttpStatusError,
+	UpstreamDeadlineError,
+	waitForDeadline
+} from './upstream';
 import {
 	getNewYorkDateISO,
 	getTaipeiDateISO,
@@ -43,6 +49,11 @@ export type Env = {
 	TW_EOD_PATCH_ROWS?: string;
 	TW_429_BLOCK_SEC?: string;
 	TW_EOD_L1_SEC?: string;
+	UPSTREAM_TIMEOUT_MS?: string;
+	UPSTREAM_MAX_ATTEMPTS?: string;
+	UPSTREAM_RETRY_BASE_MS?: string;
+	UPSTREAM_RETRY_MAX_DELAY_MS?: string;
+	UPSTREAM_REQUEST_DEADLINE_MS?: string;
 };
 
 type CloseKind = 'intraday' | 'provisional' | 'official_eod' | 'unavailable';
@@ -74,17 +85,49 @@ type ExtractedQuote = {
 	hasExplicitAsOf: boolean;
 };
 
-class HttpStatusError extends Error {
-	status: number;
+type FetchQuoteResult = Omit<ExtractedQuote, 'hasExplicitAsOf'> & {
+	hasExplicitAsOf?: boolean;
+};
 
-	constructor(message: string, status: number) {
+type SharedQuoteOutcome =
+	| {
+			cacheValue: QuoteCacheValue;
+			fromCache: boolean;
+			sourceTradingDate: string | null;
+			officialEod?: undefined;
+	  }
+	| {
+			cacheValue: null;
+			failure: 'NO_PRICE' | 'SOURCE_DATE_MISMATCH';
+			fromCache: false;
+			sourceTradingDate: string | null;
+			officialEod?: undefined;
+	  }
+	| {
+			cacheValue: null;
+			fromCache: false;
+			sourceTradingDate: string;
+			officialEod: TwEodSnapshot;
+			failure?: undefined;
+	  };
+
+class CacheReadError extends Error {
+	constructor(message: string) {
 		super(message);
-		this.name = 'HttpStatusError';
-		this.status = status;
+		this.name = 'CacheReadError';
+	}
+}
+
+class EodReadError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = 'EodReadError';
 	}
 }
 
 const TW_FUGLE_BLOCK_KEY = 'sys:tw:fugle:block_until';
+const DEFAULT_UPSTREAM_REQUEST_DEADLINE_MS = 10_000;
+const inFlightQuoteFetches = new Map<string, Promise<SharedQuoteOutcome>>();
 
 const corsHeaders = {
 	'Access-Control-Allow-Origin': '*',
@@ -110,6 +153,11 @@ function errorResponse(message: string, status = 400): Response {
 function toNumber(value: string | undefined, fallback: number): number {
 	const num = Number(value);
 	return Number.isFinite(num) ? num : fallback;
+}
+
+function toPositiveNumber(value: string | undefined, fallback: number): number {
+	const num = Number(value);
+	return Number.isFinite(num) && num > 0 ? num : fallback;
 }
 
 function toNumberValue(value: unknown): number | null {
@@ -231,13 +279,167 @@ function extractQuote(data: any): ExtractedQuote {
 	return { price, currency, asOf, hasExplicitAsOf };
 }
 
-async function fetchFugleQuote(symbol: string, env: Env) {
-	const url = `https://api.fugle.tw/marketdata/v1.0/stock/intraday/quote/${encodeURIComponent(symbol)}`;
-	const response = await fetch(url, {
-		headers: {
-			'X-API-KEY': env.FUGLE_API_KEY
+function getSingleFlightKey(
+	normalized: NormalizedSymbol,
+	closeResolution: boolean,
+	targetTradingDate: string
+): string {
+	return closeResolution
+		? `${normalized.kvKey}:provisional:${targetTradingDate}`
+		: `${normalized.kvKey}:intraday`;
+}
+
+function isUsableCachedQuote(
+	nowMs: number,
+	normalized: NormalizedSymbol,
+	cached: QuoteCacheValue,
+	env: Env
+): boolean {
+	const fetchedAtMs = Date.parse(cached.fetchedAt);
+	const ttl = getTtlSeconds(normalized.market, new Date(nowMs), env);
+	const status = classify(
+		nowMs,
+		Number.isFinite(fetchedAtMs) ? fetchedAtMs : 0,
+		ttl.soft,
+		ttl.hard,
+		cached.softTtlJitterSec ?? 0
+	);
+	return status !== 'missing';
+}
+
+type OfficialEodRecheck = () => Promise<TwEodSnapshot | null>;
+type QuoteFetcher = (deadlineAtMs?: number) => Promise<FetchQuoteResult>;
+
+async function getOrFetchQuote(
+	env: Env,
+	normalized: NormalizedSymbol,
+	targetTradingDate: string,
+	closeResolution: boolean,
+	fetcher: QuoteFetcher,
+	officialEodRecheck?: OfficialEodRecheck,
+	deadlineAtMs?: number
+): Promise<SharedQuoteOutcome> {
+	const key = getSingleFlightKey(normalized, closeResolution, targetTradingDate);
+	const existing = inFlightQuoteFetches.get(key);
+	if (existing) return waitForDeadline(existing, deadlineAtMs);
+
+	const promise = (async (): Promise<SharedQuoteOutcome> => {
+		if (deadlineAtMs !== undefined && deadlineAtMs <= Date.now()) {
+			throw new UpstreamDeadlineError();
 		}
-	});
+
+		if (closeResolution && officialEodRecheck) {
+			let officialEod: TwEodSnapshot | null;
+			try {
+				officialEod = await officialEodRecheck();
+			} catch (error) {
+				throw new EodReadError(`TW EOD recheck failed for ${normalized.kvKey}: ${String(error)}`);
+			}
+
+			if (officialEod) {
+				return {
+					cacheValue: null,
+					fromCache: false,
+					sourceTradingDate: officialEod.tradingDate,
+					officialEod
+				};
+			}
+		}
+
+		let cached: QuoteCacheValue | null;
+		try {
+			cached = await getQuote(env, normalized.kvKey);
+		} catch (error) {
+			throw new CacheReadError(`KV recheck failed for ${normalized.kvKey}: ${String(error)}`);
+		}
+
+		if (cached && isUsableCachedQuote(Date.now(), normalized, cached, env)) {
+			const sourceTradingDate = getSourceTradingDate(normalized.market, cached.asOf, cached.fetchedAt);
+			const closeCompatible =
+				!closeResolution ||
+				(cached.closeKind === 'provisional' && sourceTradingDate === targetTradingDate);
+			if (closeCompatible) {
+				return {
+					cacheValue: cached,
+					fromCache: true,
+					sourceTradingDate
+				};
+			}
+		}
+
+		if (deadlineAtMs !== undefined && deadlineAtMs <= Date.now()) {
+			throw new UpstreamDeadlineError();
+		}
+
+		const fetched = await fetcher(deadlineAtMs);
+		const fetchedAt = new Date().toISOString();
+		if (fetched.price === null) {
+			return {
+				cacheValue: null,
+				failure: 'NO_PRICE',
+				fromCache: false,
+				sourceTradingDate: null
+			};
+		}
+
+		const sourceTradingDate = closeResolution
+			? getProvisionalSourceTradingDate(fetched.asOf, fetchedAt, fetched.hasExplicitAsOf === true)
+			: getSourceTradingDate(normalized.market, fetched.asOf, fetchedAt);
+
+		if (closeResolution && sourceTradingDate !== targetTradingDate) {
+			return {
+				cacheValue: null,
+				failure: 'SOURCE_DATE_MISMATCH',
+				fromCache: false,
+				sourceTradingDate
+			};
+		}
+
+		const ttl = getTtlSeconds(normalized.market, new Date(fetchedAt), env);
+		const cacheValue: QuoteCacheValue = {
+			symbol: normalized.ticker,
+			canonicalSymbol: normalized.canonicalSymbol,
+			market: normalized.market,
+			price: fetched.price,
+			currency: fetched.currency,
+			asOf: closeResolution ? fetched.asOf : fetched.asOf ?? fetchedAt,
+			fetchedAt,
+			ttlHardSec: ttl.hard,
+			expiresAt: computeExpiresAt(fetchedAt, ttl.hard),
+			softTtlJitterSec: jitterSec(),
+			closeKind: closeResolution ? 'provisional' : 'intraday'
+		};
+
+		await putQuote(env, normalized.kvKey, cacheValue, ttl.hard);
+		return {
+			cacheValue,
+			fromCache: false,
+			sourceTradingDate
+		};
+	})();
+
+	inFlightQuoteFetches.set(key, promise);
+	const cleanup = () => {
+		if (inFlightQuoteFetches.get(key) === promise) {
+			inFlightQuoteFetches.delete(key);
+		}
+	};
+	promise.then(cleanup, cleanup);
+	return waitForDeadline(promise, deadlineAtMs);
+}
+
+async function fetchFugleQuote(symbol: string, env: Env, deadlineAtMs?: number) {
+	const url = `https://api.fugle.tw/marketdata/v1.0/stock/intraday/quote/${encodeURIComponent(symbol)}`;
+	const response = await fetchWithRetry(
+		url,
+		{
+			headers: {
+				'X-API-KEY': env.FUGLE_API_KEY
+			}
+		},
+		env,
+		{ deadlineAtMs }
+	);
 
 	if (!response.ok) {
 		throw new HttpStatusError(`Fugle API error: ${response.status}`, response.status);
@@ -261,9 +463,9 @@ export function mapFinnhubQuote(data: any): { price: number | null; currency: st
 	};
 }
 
-async function fetchFinnhubQuote(symbol: string, env: Env) {
+async function fetchFinnhubQuote(symbol: string, env: Env, deadlineAtMs?: number) {
 	const url = `https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(symbol)}&token=${encodeURIComponent(env.FINNHUB_API_KEY)}`;
-	const response = await fetch(url);
+	const response = await fetchWithRetry(url, {}, env, { deadlineAtMs });
 
 	if (!response.ok) {
 		throw new HttpStatusError(`Finnhub API error: ${response.status}`, response.status);
@@ -280,7 +482,8 @@ async function buildFromCache(
 	l1TtlSec: number,
 	normalized: NormalizedSymbol,
 	cached: QuoteCacheValue,
-	targetTradingDate: string
+	targetTradingDate: string,
+	closeKind: Extract<CloseKind, 'intraday' | 'provisional'> = 'intraday'
 ): Promise<QuoteResult> {
 	const parsedFetchedAt = Date.parse(cached.fetchedAt);
 	const fetchedAtMs = Number.isFinite(parsedFetchedAt) ? parsedFetchedAt : 0;
@@ -299,7 +502,7 @@ async function buildFromCache(
 		status,
 		isStale: isStale(status),
 		reason: status === 'missing' ? 'HARD_EXPIRED' : null,
-		closeKind: 'intraday',
+		closeKind,
 		sourceTradingDate: getSourceTradingDate(normalized.market, cached.asOf, cached.fetchedAt),
 		targetTradingDate
 	};
@@ -588,6 +791,8 @@ export default {
 		const twPostClose = isAfterTwRegularClose(now, twClose);
 		const l1TtlSec = toNumber(env.L1_TTL_SEC, 20);
 		const maxSyncFetch = toNumber(env.MAX_SYNC_FETCH, 10);
+		const upstreamDeadlineAtMs =
+			nowMs + toPositiveNumber(env.UPSTREAM_REQUEST_DEADLINE_MS, DEFAULT_UPSTREAM_REQUEST_DEADLINE_MS);
 
 		const results: QuoteResult[] = new Array(normalizedList.length);
 		const missingForFetch: Array<{
@@ -597,8 +802,15 @@ export default {
 			targetTradingDate: string;
 			closeResolution: boolean;
 		}> = [];
+		const kvCandidates: Array<{
+			index: number;
+			item: NormalizedSymbol;
+			targetTradingDate: string;
+		}> = [];
 		let twseSnapshot: TwEodSnapshot | null | undefined = undefined;
 		let tpexSnapshot: TwEodSnapshot | null | undefined = undefined;
+		let recheckedTwseSnapshot: TwEodSnapshot | null | undefined = undefined;
+		let recheckedTpexSnapshot: TwEodSnapshot | null | undefined = undefined;
 
 		const getTwseSnapshot = async () => {
 			if (twseSnapshot === undefined) {
@@ -614,6 +826,42 @@ export default {
 			return tpexSnapshot;
 		};
 
+		const getRecheckedTwseSnapshot = async () => {
+			if (recheckedTwseSnapshot === undefined) {
+				recheckedTwseSnapshot = await getLatestTwseEodSnapshot(env, nowMs, true);
+			}
+			return recheckedTwseSnapshot;
+		};
+
+		const getRecheckedTpexSnapshot = async () => {
+			if (recheckedTpexSnapshot === undefined) {
+				recheckedTpexSnapshot = await getLatestTpexEodSnapshot(env, nowMs, true);
+			}
+			return recheckedTpexSnapshot;
+		};
+
+		const findTwEodSnapshot = async (
+			item: NormalizedSymbol,
+			requireTradingDate?: string,
+			bypassCache = false
+		): Promise<TwEodSnapshot | null> => {
+			const twse = bypassCache ? await getRecheckedTwseSnapshot() : await getTwseSnapshot();
+			const twseReady = !requireTradingDate || twse?.tradingDate === requireTradingDate;
+			const twseQuote = twseReady ? getTwEodQuote(twse, item.ticker) : null;
+			if (twse && twseReady && twseQuote && twseQuote.close !== null) {
+				return twse;
+			}
+
+			const tpex = bypassCache ? await getRecheckedTpexSnapshot() : await getTpexSnapshot();
+			const tpexReady = !requireTradingDate || tpex?.tradingDate === requireTradingDate;
+			const tpexQuote = tpexReady ? getTwEodQuote(tpex, item.ticker) : null;
+			if (tpex && tpexReady && tpexQuote && tpexQuote.close !== null) {
+				return tpex;
+			}
+
+			return null;
+		};
+
 		const buildFromTwEodChain = async (
 			item: NormalizedSymbol,
 			hitReason: TwEodHitReason,
@@ -621,20 +869,12 @@ export default {
 			targetTradingDate: string,
 			requireTradingDate?: string
 		): Promise<QuoteResult> => {
-			const twse = await getTwseSnapshot();
-			const twseReady = !requireTradingDate || twse?.tradingDate === requireTradingDate;
-			const twseQuote = twseReady ? getTwEodQuote(twse, item.ticker) : null;
-			if (twse && twseReady && twseQuote && twseQuote.close !== null) {
-				return buildFromTwEod(item, twse, hitReason, hitStatus, targetTradingDate);
+			const snapshot = await findTwEodSnapshot(item, requireTradingDate);
+			if (snapshot) {
+				return buildFromTwEod(item, snapshot, hitReason, hitStatus, targetTradingDate);
 			}
 
-			const tpex = await getTpexSnapshot();
-			const tpexReady = !requireTradingDate || tpex?.tradingDate === requireTradingDate;
-			const tpexQuote = tpexReady ? getTwEodQuote(tpex, item.ticker) : null;
-			if (tpex && tpexReady && tpexQuote && tpexQuote.close !== null) {
-				return buildFromTwEod(item, tpex, hitReason, hitStatus, targetTradingDate);
-			}
-
+			const [twse, tpex] = await Promise.all([getTwseSnapshot(), getTpexSnapshot()]);
 			const reason =
 				requireTradingDate && (twse?.tradingDate !== requireTradingDate || tpex?.tradingDate !== requireTradingDate)
 					? 'TW_EOD_NOT_READY'
@@ -706,11 +946,21 @@ export default {
 				continue;
 			}
 
-			const cached = await getQuote(env, item.kvKey);
+			kvCandidates.push({ index: i, item, targetTradingDate });
+		}
+
+		const cachedValues = await getQuotes(
+			env,
+			kvCandidates.map(({ item }) => item.kvKey)
+		);
+
+		for (let i = 0; i < kvCandidates.length; i += 1) {
+			const { index, item, targetTradingDate } = kvCandidates[i];
+			const cached = cachedValues[i];
 			if (!cached) {
-				results[i] = await buildMissing(item, 'KV_MISS', targetTradingDate);
+				results[index] = await buildMissing(item, 'KV_MISS', targetTradingDate);
 				missingForFetch.push({
-					index: i,
+					index,
 					item,
 					reason: 'KV_MISS',
 					targetTradingDate,
@@ -731,9 +981,9 @@ export default {
 			);
 
 			if (cachedResult.status === 'missing') {
-				results[i] = { ...cachedResult, reason: 'HARD_EXPIRED' };
+				results[index] = { ...cachedResult, reason: 'HARD_EXPIRED' };
 				missingForFetch.push({
-					index: i,
+					index,
 					item,
 					reason: 'HARD_EXPIRED',
 					targetTradingDate,
@@ -742,7 +992,7 @@ export default {
 				continue;
 			}
 
-			results[i] = cachedResult;
+			results[index] = cachedResult;
 		}
 
 		if (missingForFetch.length > 0 && maxSyncFetch > 0) {
@@ -768,12 +1018,81 @@ export default {
 					continue;
 				}
 
-					try {
-						const fetchedAt = new Date().toISOString();
-						const { price, currency, asOf, hasExplicitAsOf } = await fetchFugleQuote(item.ticker, env);
+				try {
+					const officialEodRecheck =
+						closeResolution && env.TW_EOD_R2
+							? () => findTwEodSnapshot(item, targetTradingDate, true)
+							: undefined;
+					const shared = await getOrFetchQuote(
+						env,
+						item,
+						targetTradingDate,
+						closeResolution,
+						(deadlineAtMs) => fetchFugleQuote(item.ticker, env, deadlineAtMs),
+						officialEodRecheck,
+						upstreamDeadlineAtMs
+					);
 
-					if (price === null) {
+					if (shared.officialEod) {
+						const eodResult = buildFromTwEod(
+							item,
+							shared.officialEod,
+							'TW_EOD_OFFHOURS',
+							'fresh',
+							targetTradingDate
+						);
+						l1Set(item.kvKey, eodResult, l1TtlSec, nowMs);
+						results[index] = eodResult;
+						continue;
+					}
+
+					if (shared.cacheValue) {
+						if (shared.fromCache) {
+							const ttl = getTtlSeconds(item.market, now, env);
+							results[index] = await buildFromCache(
+								nowMs,
+								ttl.soft,
+								ttl.hard,
+								l1TtlSec,
+								item,
+								shared.cacheValue,
+								targetTradingDate,
+								closeResolution ? 'provisional' : 'intraday'
+							);
+						} else {
+							const freshResult = buildFreshQuoteResult(
+								item,
+								shared.cacheValue,
+								closeResolution ? 'provisional' : 'intraday',
+								shared.sourceTradingDate,
+								targetTradingDate
+							);
+							l1Set(item.kvKey, freshResult, l1TtlSec);
+							results[index] = freshResult;
+						}
+						continue;
+					}
+
+					if (shared.failure === 'SOURCE_DATE_MISMATCH') {
+						results[index] = await buildMissing(
+							item,
+							'TW_PROVISIONAL_SOURCE_DATE_MISMATCH',
+							targetTradingDate
+						);
+					} else {
 						console.warn('Fugle quote missing price', { symbol: item.ticker });
+						results[index] = closeResolution
+							? await buildMissing(item, 'TW_PROVISIONAL_UNAVAILABLE', targetTradingDate)
+							: {
+									...results[index],
+									reason: 'FUGLE_ERROR'
+								};
+					}
+				} catch (error) {
+					if (error instanceof CacheReadError || error instanceof EodReadError) {
+						throw error;
+					}
+					if (error instanceof UpstreamDeadlineError) {
 						results[index] = closeResolution
 							? await buildMissing(item, 'TW_PROVISIONAL_UNAVAILABLE', targetTradingDate)
 							: {
@@ -782,46 +1101,6 @@ export default {
 								};
 						continue;
 					}
-
-					const sourceTradingDate = closeResolution
-						? getProvisionalSourceTradingDate(asOf, fetchedAt, hasExplicitAsOf)
-						: getSourceTradingDate(item.market, asOf, fetchedAt);
-					if (closeResolution && sourceTradingDate !== targetTradingDate) {
-						results[index] = await buildMissing(
-							item,
-							'TW_PROVISIONAL_SOURCE_DATE_MISMATCH',
-							targetTradingDate
-						);
-						continue;
-					}
-
-					const ttl = getTtlSeconds(item.market, new Date(fetchedAt), env);
-					const cacheValue: QuoteCacheValue = {
-						symbol: item.ticker,
-						canonicalSymbol: item.canonicalSymbol,
-						market: item.market,
-						price,
-						currency,
-						asOf: closeResolution ? asOf : asOf ?? fetchedAt,
-						fetchedAt,
-						ttlHardSec: ttl.hard,
-						expiresAt: computeExpiresAt(fetchedAt, ttl.hard),
-						softTtlJitterSec: jitterSec()
-					};
-
-					await putQuote(env, item.kvKey, cacheValue, ttl.hard);
-
-					const freshResult = buildFreshQuoteResult(
-						item,
-						cacheValue,
-						closeResolution ? 'provisional' : 'intraday',
-						sourceTradingDate,
-						targetTradingDate
-					);
-
-					l1Set(item.kvKey, freshResult, l1TtlSec);
-					results[index] = freshResult;
-				} catch (error) {
 					if (isRateLimited(error)) {
 						twRateLimited = true;
 						await setTwFugleBlockUntilMs(env, Date.now(), toNumber(env.TW_429_BLOCK_SEC, 60));
@@ -847,45 +1126,58 @@ export default {
 				await Promise.all(
 					batch.map(async ({ index, item, targetTradingDate }) => {
 						try {
-							const fetchedAt = new Date().toISOString();
-							const { price, currency, asOf } = await fetchFinnhubQuote(item.ticker, env);
+							const shared = await getOrFetchQuote(
+								env,
+								item,
+								targetTradingDate,
+								false,
+								(deadlineAtMs) => fetchFinnhubQuote(item.ticker, env, deadlineAtMs),
+								undefined,
+								upstreamDeadlineAtMs
+							);
 
-							if (price === null) {
-								console.warn('Finnhub quote missing price', { symbol: item.ticker });
+							if (shared.cacheValue) {
+								if (shared.fromCache) {
+									const ttl = getTtlSeconds(item.market, now, env);
+									results[index] = await buildFromCache(
+										nowMs,
+										ttl.soft,
+										ttl.hard,
+										l1TtlSec,
+										item,
+										shared.cacheValue,
+										targetTradingDate
+									);
+								} else {
+									const freshResult = buildFreshQuoteResult(
+										item,
+										shared.cacheValue,
+										'intraday',
+										shared.sourceTradingDate,
+										targetTradingDate
+									);
+									l1Set(item.kvKey, freshResult, l1TtlSec);
+									results[index] = freshResult;
+								}
+								return;
+							}
+
+							console.warn('Finnhub quote missing price', { symbol: item.ticker });
+							results[index] = {
+								...results[index],
+								reason: 'FINNHUB_ERROR'
+							};
+						} catch (error) {
+							if (error instanceof CacheReadError) {
+								throw error;
+							}
+							if (error instanceof UpstreamDeadlineError) {
 								results[index] = {
 									...results[index],
 									reason: 'FINNHUB_ERROR'
 								};
 								return;
 							}
-
-							const ttl = getTtlSeconds(item.market, new Date(fetchedAt), env);
-							const cacheValue: QuoteCacheValue = {
-								symbol: item.ticker,
-								canonicalSymbol: item.canonicalSymbol,
-								market: item.market,
-								price,
-								currency,
-								asOf: asOf ?? fetchedAt,
-								fetchedAt,
-								ttlHardSec: ttl.hard,
-								expiresAt: computeExpiresAt(fetchedAt, ttl.hard),
-								softTtlJitterSec: jitterSec()
-							};
-
-							await putQuote(env, item.kvKey, cacheValue, ttl.hard);
-
-							const freshResult = buildFreshQuoteResult(
-								item,
-								cacheValue,
-								'intraday',
-								getSourceTradingDate(item.market, cacheValue.asOf, cacheValue.fetchedAt),
-								targetTradingDate
-							);
-
-							l1Set(item.kvKey, freshResult, l1TtlSec);
-							results[index] = freshResult;
-						} catch (error) {
 							console.error('Finnhub quote failed', { symbol: item.ticker, error });
 							results[index] = {
 								...results[index],

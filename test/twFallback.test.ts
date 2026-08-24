@@ -75,6 +75,7 @@ function makeEnv(args: {
 		TW_OPEN: '09:00',
 		TW_CLOSE: '13:30',
 		TW_429_BLOCK_SEC: '60',
+		UPSTREAM_MAX_ATTEMPTS: '1',
 		...args.overrides
 	} as unknown as Parameters<typeof worker.fetch>[1];
 }
@@ -262,6 +263,125 @@ describe('TW EOD fallback behavior', () => {
 		expect(json.results[0].fetchedAt).toBe('2026-02-10T06:00:00.000Z');
 		expect(json.results[0].closeKind).toBe('provisional');
 		expect(json.results[0].sourceTradingDate).toBe('2026-02-10');
+	});
+
+	it('reuses a same-day provisional cache without fetching again after close', async () => {
+		vi.setSystemTime(new Date('2026-02-10T06:00:00.000Z')); // 14:00 Asia/Taipei
+		const kv = createKv();
+		const r2 = createR2({
+			[TWSE_EOD_LATEST_KEY]: JSON.stringify(
+				buildTwEodSnapshot({
+					tradingDate: '2026-02-09',
+					fetchedAt: '2026-02-09T06:00:00.000Z'
+				})
+			)
+		});
+		const fetchMock = vi.fn(async () =>
+			new Response(
+				JSON.stringify({
+					lastPrice: 1090,
+					lastUpdated: '2026-02-10T05:31:00.000Z'
+				}),
+				{
+					status: 200,
+					headers: { 'Content-Type': 'application/json' }
+				}
+			)
+		);
+		vi.stubGlobal('fetch', fetchMock);
+		const env = makeEnv({ kv, r2 });
+
+		const firstResponse = await callTwBatch(env, ['2330']);
+		const firstJson = (await firstResponse.json()) as any;
+		expect(firstJson.results[0].closeKind).toBe('provisional');
+
+		l1Clear();
+		const secondResponse = await callTwBatch(env, ['2330']);
+		const secondJson = (await secondResponse.json()) as any;
+
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+		expect(secondJson.results[0].price).toBe(1090);
+		expect(secondJson.results[0].closeKind).toBe('provisional');
+		expect(secondJson.results[0].sourceTradingDate).toBe('2026-02-10');
+	});
+
+	it('prefers an official EOD snapshot discovered during the post-close recheck', async () => {
+		vi.setSystemTime(new Date('2026-02-10T06:00:00.000Z')); // 14:00 Asia/Taipei
+		const kv = createKv();
+		const oldSnapshot = buildTwEodSnapshot({
+			tradingDate: '2026-02-09',
+			fetchedAt: '2026-02-09T06:00:00.000Z'
+		});
+		const currentSnapshot = buildTwEodSnapshot();
+		const r2 = createR2({
+			[TWSE_EOD_LATEST_KEY]: JSON.stringify(oldSnapshot)
+		});
+		const bucket = r2.bucket as unknown as {
+			get(key: string): Promise<R2ObjectBody | null>;
+		};
+		const originalGet = bucket.get.bind(bucket);
+		let twseReads = 0;
+		bucket.get = async (key: string) => {
+			const body = await originalGet(key);
+			if (key === TWSE_EOD_LATEST_KEY && twseReads++ === 0) {
+				r2.objects.set(key, JSON.stringify(currentSnapshot));
+			}
+			return body;
+		};
+
+		const fetchMock = vi.fn();
+		vi.stubGlobal('fetch', fetchMock);
+
+		const response = await callTwBatch(makeEnv({ kv, r2 }), ['2330']);
+		const json = (await response.json()) as any;
+
+		expect(fetchMock).not.toHaveBeenCalled();
+		expect(json.results[0].price).toBe(1080);
+		expect(json.results[0].closeKind).toBe('official_eod');
+		expect(json.results[0].sourceTradingDate).toBe('2026-02-10');
+	});
+
+	it('rejects a no-asOf provisional response that completes after Taipei midnight', async () => {
+		vi.setSystemTime(new Date('2026-02-10T15:59:59.000Z')); // 23:59:59 Asia/Taipei
+		const kv = createKv();
+		const r2 = createR2({
+			[TWSE_EOD_LATEST_KEY]: JSON.stringify(
+				buildTwEodSnapshot({
+					tradingDate: '2026-02-09',
+					fetchedAt: '2026-02-09T06:00:00.000Z'
+				})
+			)
+		});
+		let resolveFetch: ((response: Response) => void) | undefined;
+		let resolveStarted: (() => void) | undefined;
+		const fetchStarted = new Promise<void>((resolve) => {
+			resolveStarted = resolve;
+		});
+		const fetchMock = vi.fn(
+			() =>
+				new Promise<Response>((resolve) => {
+					resolveFetch = resolve;
+					resolveStarted?.();
+				})
+		);
+		vi.stubGlobal('fetch', fetchMock);
+
+		const responsePromise = callTwBatch(makeEnv({ kv, r2 }), ['2330']);
+		await fetchStarted;
+		vi.setSystemTime(new Date('2026-02-10T16:00:01.000Z')); // 00:00:01 Asia/Taipei
+		resolveFetch?.(
+			new Response(JSON.stringify({ lastPrice: 1090 }), {
+				status: 200,
+				headers: { 'Content-Type': 'application/json' }
+			})
+		);
+
+		const response = await responsePromise;
+		const json = (await response.json()) as any;
+
+		expect(json.results[0].price).toBeNull();
+		expect(json.results[0].reason).toBe('TW_PROVISIONAL_SOURCE_DATE_MISMATCH');
+		expect(json.results[0].targetTradingDate).toBe('2026-02-10');
 	});
 
 	it('returns unavailable after close when Fugle quote is not from the target trading date', async () => {

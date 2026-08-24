@@ -237,12 +237,13 @@ async function fetchJsonFromUrl(url: string): Promise<unknown> {
 async function getLatestSnapshot(
 	env: EnvWithTwEod,
 	board: Board,
-	nowMs = Date.now()
+	nowMs = Date.now(),
+	bypassCache = false
 ): Promise<TwEodSnapshot | null> {
 	if (!env.TW_EOD_R2) return null;
 
 	const cached = caches[board];
-	if (cached && nowMs < cached.expiresAtMs) {
+	if (!bypassCache && cached && nowMs < cached.expiresAtMs) {
 		return cached.snapshot;
 	}
 
@@ -490,16 +491,18 @@ export function getTpexEodDateKey(tradingDate: string): string {
 
 export async function getLatestTwseEodSnapshot(
 	env: EnvWithTwEod,
-	nowMs = Date.now()
+	nowMs = Date.now(),
+	bypassCache = false
 ): Promise<TwEodSnapshot | null> {
-	return getLatestSnapshot(env, 'TWSE', nowMs);
+	return getLatestSnapshot(env, 'TWSE', nowMs, bypassCache);
 }
 
 export async function getLatestTpexEodSnapshot(
 	env: EnvWithTwEod,
-	nowMs = Date.now()
+	nowMs = Date.now(),
+	bypassCache = false
 ): Promise<TwEodSnapshot | null> {
-	return getLatestSnapshot(env, 'TPEX', nowMs);
+	return getLatestSnapshot(env, 'TPEX', nowMs, bypassCache);
 }
 
 export function getTwEodQuote(snapshot: TwEodSnapshot | null, ticker: string): TwEodQuote | null {

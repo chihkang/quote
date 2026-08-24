@@ -45,6 +45,11 @@
 		"TPEX_EOD_URL": "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes",
 		"TW_EOD_PATCH_ROWS": "239",
 		"TW_429_BLOCK_SEC": "60",
-		"TW_EOD_L1_SEC": "60"
+		"TW_EOD_L1_SEC": "60",
+		"UPSTREAM_TIMEOUT_MS": "3000",
+		"UPSTREAM_MAX_ATTEMPTS": "3",
+		"UPSTREAM_RETRY_BASE_MS": "200",
+		"UPSTREAM_RETRY_MAX_DELAY_MS": "2000",
+		"UPSTREAM_REQUEST_DEADLINE_MS": "10000"
 	}
 }

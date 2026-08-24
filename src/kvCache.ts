@@ -9,6 +9,7 @@ export type QuoteCacheValue = {
   ttlHardSec?: number;
   expiresAt?: string;
   softTtlJitterSec?: number;
+  closeKind?: 'intraday' | 'provisional';
 };
 
 export type EnvWithKV = {
@@ -23,6 +24,13 @@ export async function getQuote(env: EnvWithKV, key: string): Promise<QuoteCacheV
   } catch {
     return null;
   }
+}
+
+export async function getQuotes(
+  env: EnvWithKV,
+  keys: string[]
+): Promise<Array<QuoteCacheValue | null>> {
+  return Promise.all(keys.map((key) => getQuote(env, key)));
 }
 
 export async function putQuote(
