@@ -13,7 +13,7 @@ This is a TypeScript Cloudflare Worker for batch Taiwan and US stock quotes, wit
 | Task | Reference |
 | --- | --- |
 | API usage, response fields, setup, configuration, or deployment | [README.md](README.md) and scripts in [package.json](package.json) |
-| Close kinds, source/target trading dates, or settlement behavior | [CONTEXT.md](CONTEXT.md) and the [close-semantics ADR](docs/adr/0001-separate-close-semantics-from-cache-freshness.md) |
+| Close kinds, source/target trading dates, or settlement behavior | [CONTEXT.md](CONTEXT.md), the [completed-session ADR](docs/adr/0002-completed-market-session-context.md), and the [original close-semantics ADR](docs/adr/0001-separate-close-semantics-from-cache-freshness.md) |
 | Request routing, provider calls, or fetch limits | [src/index.ts](src/index.ts) |
 | Symbol handling | [src/symbols.ts](src/symbols.ts) |
 | Cache classification, retention, or market-session timing | [src/quotePolicy.ts](src/quotePolicy.ts), [src/kvCache.ts](src/kvCache.ts), [src/l1Cache.ts](src/l1Cache.ts), [src/ttl.ts](src/ttl.ts), and [src/time.ts](src/time.ts) |
@@ -25,7 +25,7 @@ This is a TypeScript Cloudflare Worker for batch Taiwan and US stock quotes, wit
 - Normalize symbols before cache access. Keep canonical cache keys in `quote:{MARKET}:{TICKER}` form and preserve distinct securities.
 - Keep `QuoteCacheValue` and API response mapping consistent. Preserve existing field meanings when extending the response.
 - Keep freshness (`fresh`, `stale`, `missing`) independent of `closeKind`. A stale intraday quote remains intraday data.
-- After Taiwan regular-session close, prefer an official EOD close for the target trading date before ordinary L1/KV hits. Otherwise use a same-day provisional quote or return an unavailable close with `price=null`; an older close cannot represent the target date.
+- Resolve Taiwan official EOD against `expectedCloseTradingDate`, before ordinary L1/KV hits after a real trading session ends. On that day, require its own official close, then same-day provisional data or `price=null`. Pre-open and holiday R2 resolution may use the earlier expected completed official session while preserving its actual source date; never fabricate a holiday provisional quote or accept an older-than-expected close.
 - Use market-local trading dates (Taipei for TW, New York for US). Apply the ADR's timestamp rules when establishing a provisional quote's source date, keeping `asOf` and `fetchedAt` distinct.
 - US quotes use Finnhub and do not inherit Taiwan R2 EOD fallback or official-close semantics.
 - Use `getTtlSeconds()` for quote TTL decisions. Preserve the shared per-request `MAX_SYNC_FETCH` cap and the US provider concurrency limit of 5 unless changing those policies is part of the request.

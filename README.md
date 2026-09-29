@@ -91,7 +91,7 @@ Response:
 
 ```json
 {
-	"serverTime": "2026-01-26T00:00:00.000Z",
+	"serverTime": "2026-01-26T01:00:00.000Z",
 	"results": [
 		{
 			"symbol": "2330",
@@ -99,16 +99,20 @@ Response:
 			"market": "TW",
 			"price": 590,
 			"currency": "TWD",
-			"asOf": "2026-01-26T00:00:00.000Z",
-			"fetchedAt": "2026-01-26T00:00:01.000Z",
+			"asOf": "2026-01-26T01:00:00.000Z",
+			"fetchedAt": "2026-01-26T01:00:01.000Z",
 			"ttlHardSec": 300,
-			"expiresAt": "2026-01-26T00:05:01.000Z",
+			"expiresAt": "2026-01-26T01:05:01.000Z",
 			"status": "fresh",
 			"isStale": false,
 			"reason": null,
 			"closeKind": "intraday",
 			"sourceTradingDate": "2026-01-26",
-			"targetTradingDate": "2026-01-26"
+			"targetTradingDate": "2026-01-26",
+			"expectedCloseTradingDate": "2026-01-23",
+			"marketSessionState": "open",
+			"calendarVersion": "twse-nyse-2026-v1",
+			"sourceTimestampVerified": false
 		}
 	]
 }
@@ -132,7 +136,13 @@ Response:
 - `reason`: One of `KV_MISS`, `HARD_EXPIRED`, `FUGLE_ERROR`, `FINNHUB_ERROR`, `TW_EOD_OFFHOURS`, `TW_EOD_FALLBACK_429`, `TW_EOD_MISS`, `TW_EOD_NOT_READY`, `TW_EOD_NOT_CONFIGURED`, `TW_PROVISIONAL_UNAVAILABLE`, `TW_PROVISIONAL_SOURCE_DATE_MISMATCH`, or `null`.
 - `closeKind`: Price semantics: `intraday`, `provisional`, `official_eod`, or `unavailable`.
 - `sourceTradingDate`: Market-local trading date represented by the source data, or `null` when unavailable. TW uses Taipei date; US intraday quotes use New York date.
-- `targetTradingDate`: Market-local trading date the response is resolving for. Consumers should compare this with `sourceTradingDate` before settlement/reconcile.
+- `targetTradingDate`: Request's market-local civil date, recomputed even for cache hits. It need not be a trading day.
+- `expectedCloseTradingDate`: Latest completed market session from the calendar, or `null` when no session can be established. Settlement compares `sourceTradingDate` with this field.
+- `marketSessionState`: `pre_open`, `open`, `post_close`, or `closed` at request time.
+- `calendarVersion`: Calendar rules used for the context, or `null` outside coverage. Settlement clients must use matching rules and versions.
+- `sourceTimestampVerified`: Whether a US source timestamp came from the provider. Legacy or missing provider time is false; `fetchedAt` never fills missing US `asOf`. This flag alone does not prove a completed close.
+
+For example, a Taiwan official close on the 2026/9/28 holiday has `targetTradingDate=2026-09-28`, `expectedCloseTradingDate=2026-09-24`, `sourceTradingDate=2026-09-24`, and `marketSessionState=closed`. Preserve the real source date; do not relabel it as a 9/28 close. See [settlement calendar context](#settlement-calendar-context) for coverage and US provenance rules.
 
 ### Curl example
 
@@ -172,7 +182,7 @@ This section describes runtime quote lookup behavior for `POST /quotes/batch` by
 
 #### TW market in trading session
 
-- Trading session is controlled by `TW_OPEN` and `TW_CLOSE` (default `09:00-13:30`, Asia/Taipei).
+- Trading session requires an open day in the bundled Taiwan calendar and uses `TW_OPEN` / `TW_CLOSE` (default `09:00-13:30`, Asia/Taipei). Published holidays are closed.
 - Lookup order:
 	- L1 in-memory cache
 	- KV cache
@@ -223,9 +233,9 @@ sequenceDiagram
     end
 ```
 
-#### TW market after regular close
+#### TW market after regular close on a trading day
 
-- Regular close starts after `TW_CLOSE` (default `13:30`, Asia/Taipei). At `13:30` itself, the quote is still treated as intraday.
+- Post-close resolution requires a real trading day and starts after `TW_CLOSE` (default `13:30`, Asia/Taipei); its `expectedCloseTradingDate` equals the current market date. At `13:30` itself, the quote is still treated as intraday.
 - Close resolution bypasses ordinary quote L1/KV first, so earlier intraday/provisional cache entries cannot hide a current-day official EOD close.
 - Lookup order:
 	- Current-day R2 EOD chain (`TWSE -> TPEX`) when `TW_EOD_R2` is configured.
@@ -240,12 +250,12 @@ sequenceDiagram
 	- Same-day Fugle provisional hit: `status=fresh`, `reason=null`, `closeKind=provisional`
 	- EOD not ready and no usable provisional: `status=missing`, `reason` is `TW_EOD_NOT_READY`, `TW_PROVISIONAL_UNAVAILABLE`, or `TW_PROVISIONAL_SOURCE_DATE_MISMATCH`, `closeKind=unavailable`
 
-#### TW market before regular close but outside the session
+#### TW market pre-open and holidays
 
-- This preserves the previous latest-EOD display behavior for pre-open and other non-close-resolution windows.
-- If `TW_EOD_R2` is configured, TW symbols use the latest R2 EOD chain:
+- If `TW_EOD_R2` is configured, TW symbols check the R2 EOD chain for an official close matching `expectedCloseTradingDate`:
 	- `twse/eod/latest.json` first
 	- then `tpex/eod/latest.json`
+- A prior official close is valid only when it is the expected completed session. A holiday does not produce a same-day provisional close. Unknown calendar coverage cannot establish a valid completed close.
 - If `TW_EOD_R2` is not configured, Worker falls back to normal L1/KV/API flow.
 - Typical response mapping:
 	- EOD hit: `status=fresh`, `reason=TW_EOD_OFFHOURS`, `closeKind=official_eod`
@@ -257,9 +267,9 @@ sequenceDiagram
 - Lookup order is the same in both US trading and off-hours:
 	- L1 in-memory cache
 	- KV cache
-	- Finnhub API (only for unresolved symbols, batched with concurrency limit 5)
+	- Finnhub API (for unresolved symbols and legacy US cache entries lacking timestamp provenance, batched with concurrency limit 5)
 - `MAX_SYNC_FETCH` is a per-request global cap shared by TW and US unresolved symbols.
-- Main difference between US trading and off-hours is TTL policy (`getTtlSeconds`), not source order.
+- Main difference between US trading and off-hours is TTL policy (`getTtlSeconds`), not source order. The diagram below shows ordinary cache lookup; legacy US entries without `sourceTimestampVerified` additionally get one refresh within the shared fetch cap, even while otherwise fresh. A known false flag waits for ordinary expiry instead of repeatedly fetching.
 
 ```mermaid
 sequenceDiagram
@@ -316,13 +326,13 @@ Environment variables are defined in [wrangler.jsonc](wrangler.jsonc). Key setti
 
 - `DEFAULT_MARKET`: Default market when symbols do not specify one.
 - `MAX_SYMBOLS_PER_REQUEST`: Max symbols per request.
-- `MAX_SYNC_FETCH`: Max cache misses to fetch from Fugle per request.
+- `MAX_SYNC_FETCH`: Shared per-request cap for synchronous TW/US provider fetches, including legacy US provenance refreshes.
 - `TW_OPEN` / `TW_CLOSE`: TW trading session window (Asia/Taipei).
-- US trading session is computed automatically from `America/New_York` market hours (`09:30-16:00` local time).
+- US trading session is computed from the bundled NYSE calendar in `America/New_York` (normally `09:30-16:00`, with published holidays and early closes).
 	- DST switches automatically between EST and EDT; no manual seasonal config is needed.
 	- TTL uses the New York trading session to decide trading vs off-hours.
 	- If you see `expiresAt` only `+5 minutes`, the quote was classified inside the US trading session.
-- `US_HOLIDAYS`: Optional comma-separated `YYYY-MM-DD` dates treated as US market holidays in the `America/New_York` calendar.
+- `US_HOLIDAYS`: Optional comma-separated extra closures in `America/New_York`; published NYSE holidays apply even when this is empty. Extra dates outside the published holiday list produce a `-override` calendar version, requiring matching App calendar rules and version before settlement. Duplicating a published holiday does not change the version.
 - `SOFT_TTL_TRADING_SEC` / `HARD_TTL_TRADING_SEC`: TTL during trading hours.
 - `SOFT_TTL_OFFHOURS_SEC`: Soft TTL outside trading hours.
 - `HARD_TTL_OFFHOURS_SEC`: Legacy fallback (not used for TW/US dynamic off-hours TTLs).
@@ -341,7 +351,7 @@ Environment variables are defined in [wrangler.jsonc](wrangler.jsonc). Key setti
 ### Scheduled refresh
 
 - `wrangler.jsonc` defines weekday cron triggers to refresh TWSE/TPEX EOD snapshots after close.
-- Worker code additionally gates refresh by Asia/Taipei local time window: weekdays `13:40-18:59`.
+- Worker code additionally gates refresh by Asia/Taipei local time window: weekdays `13:40-18:59`, and requires a post-close session in the Taiwan calendar; published holidays are skipped.
 - Scheduled job fetches both sources and writes separate snapshots:
 	- `twse/eod/latest.json`
 	- `twse/eod/YYYY-MM-DD.json`

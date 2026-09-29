@@ -1,6 +1,6 @@
 # Quote Context
 
-This context defines the market-price language used by the quote service. It exists to keep intraday quotes, provisional closes, and official end-of-day closes distinct when Taiwan market data transitions after the close.
+This context defines the market-price language used by the quote service. It keeps close quality, cache freshness, request dates, and completed market sessions distinct. [ADR 0002](docs/adr/0002-completed-market-session-context.md) defines the current date comparison; [ADR 0001](docs/adr/0001-separate-close-semantics-from-cache-freshness.md) preserves the original close-quality rationale.
 
 ## Language
 
@@ -17,19 +17,19 @@ The exchange-confirmed end-of-day close for a specific trading date. It supersed
 _Avoid_: provisional close, latest quote, cached quote
 
 **Official EOD Readiness**:
-The condition that official EOD source data for the target trading date contains a valid close for a symbol. It is not implied by regular session close; source data that still reports an older source trading date is not ready.
+The condition that official EOD source data for `expectedCloseTradingDate` contains a valid close for a symbol. Session close alone does not establish readiness. On a real post-close trading day, expected is today; on a holiday, a prior completed session can be ready. Source data older than expected is not ready.
 _Avoid_: session closed, refresh completed
 
 **Close Kind**:
-The category that tells consumers whether a price is an intraday quote, provisional close, official EOD close, or unavailable for the requested trading date. It is separate from freshness or cache status; a stale cached intraday quote remains intraday.
+The category that tells consumers whether a price is an intraday quote, provisional close, official EOD close, or unavailable for the expected completed session. It is separate from freshness or cache status; a stale cached intraday quote remains intraday.
 _Avoid_: freshness status, stale flag
 
 **Close Resolution**:
-The domain choice of which close kind represents a symbol for a target trading date. After regular session close, an official EOD close wins; otherwise a same-day provisional close may be used, and older source data must not stand in for the target trading date.
+The domain choice of close kind for the expected completed session. After a real Taiwan session ends, its official close wins, then same-day provisional data, then unavailable. Pre-open and holidays may resolve the earlier expected official session; source data must retain its actual date and must not be older than expected.
 _Avoid_: cache lookup order, fallback chain
 
 **Unavailable Close**:
-A close for the target trading date that cannot be provided because neither an official EOD close nor a same-day provisional close is available. It has no price value; older closes can only be reference data, not the unavailable close itself.
+A required completed close that cannot be provided. After a real Taiwan session ends, neither its official close nor a valid same-day provisional close is available; holiday R2 resolution requires the earlier expected official close and does not try a holiday provisional. It has no price value. Unknown calendar coverage cannot prove a completed close.
 _Avoid_: yesterday's close, stale close, zero close, reference close
 
 **Regular Session Close**:
@@ -41,15 +41,35 @@ The market-local trading date represented by the source data behind a quote or c
 _Avoid_: fetch date, cache date, server date
 
 **Target Trading Date**:
-The market-local trading date the consumer is asking the quote service to represent. It is the comparison point for deciding whether source data belongs to the requested trading date.
-_Avoid_: request date, server date
+The request's market-local civil date, recomputed for each batch response, including cache hits. It is not necessarily a completed trading day and is not the settlement source-date comparison point.
+_Avoid_: expected close date, valuation date, server UTC date
+
+**Expected Completed Trading Date**:
+`expectedCloseTradingDate` identifies the latest completed session from the versioned market calendar at request time. Compare close sources with this field, not with `targetTradingDate`. Unknown coverage returns no expected date.
+_Avoid_: latest cached date, weekday guess
+
+**Valuation Date**:
+The consumer's portfolio date, which AssetGuardian defines as a Taipei civil date. Different markets may contribute different completed source trading dates to one valuation.
+_Avoid_: source date, request market date
+
+**Session And Calendar Version**:
+`marketSessionState` is `pre_open`, `open`, `post_close`, or `closed`; `calendarVersion` identifies the rules used to derive the expected session. Clients must use matching rules and versions. Runtime overrides are not automatically compatible with a client's bundled calendar.
+_Avoid_: freshness status, provider timestamp
+
+**US Source Timestamp Provenance**:
+`sourceTimestampVerified` records whether a US timestamp came from the provider. Legacy or missing timestamps are unverified; `fetchedAt` must never substitute for US `asOf`. A timestamp must also match the expected session's actual close to prove a provider-at-close input. The separate Taiwan provisional inference exception in ADR 0001 remains in effect.
+_Avoid_: official US close, fetch time equals source time
 
 **Settlement Close**:
-The close price used by downstream portfolio or daily-review flows for a given trading date. It may start as a provisional close, but must remain distinguishable from and replaceable by the official EOD close.
+The validated close input used by downstream valuation or daily-review flows. Taiwan may start as provisional and later upgrade to official for the same session. US Finnhub data remains provider quality even when its verified timestamp matches the calendar close. Cache freshness alone never establishes settlement validity.
 _Avoid_: cached price, display price
 
 ## Example Dialogue
 
-Developer: "It is 13:35 and the official EOD close is not available yet. Should we show yesterday's close?"
+Developer: "It is 13:35 on a real Taiwan trading day and today's official EOD close is not available yet. Should we use yesterday's close for settlement?"
 
-Domain Expert: "No. Use a provisional close if one is available, and label it as provisional. Once the official EOD close arrives for today, reconcile the settlement close."
+Domain Expert: "No. Use valid same-day provisional data if available and label it provisional. Once today's official EOD close arrives, reconcile the settlement input."
+
+Developer: "On the 2026/9/28 Taiwan holiday, target is 9/28 but source is 9/24. Is that wrong?"
+
+Domain Expert: "No. Expected completed session is 9/24. That official close can serve the 9/28 valuation while retaining source date 9/24. It is not a 9/28 provisional close."

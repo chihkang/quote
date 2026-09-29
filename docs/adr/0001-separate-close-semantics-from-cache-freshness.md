@@ -4,6 +4,8 @@ status: accepted
 
 # Separate Close Semantics From Cache Freshness
 
+> Date-comparison update: [ADR 0002](0002-completed-market-session-context.md) supersedes this record's source-equals-target rule. Current consumers compare source with `expectedCloseTradingDate`; pre-open and holidays may use an earlier completed session without relabeling its source date. The original freshness/quality separation, real-trading-day provisional rules, and Taiwan timestamp inference exception remain applicable. The text below preserves the original decision.
+
 The quote service distinguishes close semantics from cache freshness so consumers can tell whether a price is an intraday quote, provisional close, official EOD close, or unavailable for the target trading date. After regular session close, an official EOD close wins when the source trading date matches the target trading date; otherwise a same-day provisional close may be used, and older EOD data must not stand in for the target trading date. This avoids downstream settlement flows treating a fresh cache hit or stale fallback as a confirmed current-day close.
 
 ## Considered Options
