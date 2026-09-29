@@ -5,6 +5,7 @@ export type QuoteCacheValue = {
   price: number | null;
   currency: string | null;
   asOf: string | null;
+  sourceTimestampVerified?: boolean;
   fetchedAt: string;
   ttlHardSec?: number;
   expiresAt?: string;

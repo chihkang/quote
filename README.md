@@ -369,3 +369,13 @@ npm test
 Maintained by repository owners and contributors.
 
 Contributions are welcome via pull requests. Please include tests for new behavior and keep changes focused on the current Worker scope.
+
+## Settlement calendar context
+
+Batch results add nullable `expectedCloseTradingDate` and `calendarVersion`, plus `marketSessionState` (`pre_open`, `open`, `post_close`, `closed`). Existing `targetTradingDate` remains the request's market-local civil date. Holidays may legitimately have an earlier source date matching the expected completed session. A real trading day after close still requires its own source date. The bundled calendar covers December 2025–December 2026; unknown coverage returns no expected close. See [ADR 0002](docs/adr/0002-completed-market-session-context.md). No historical quote endpoint is implied.
+
+US quote responses preserve the provider's raw timestamp. `sourceTimestampVerified` is false for legacy caches or missing provider time; `fetchedAt` is never substituted for a missing US `asOf`. These quotes remain usable by ordinary displays but cannot prove a completed close.
+
+Taiwan `TW_OPEN` / `TW_CLOSE` must be valid HH:mm values with open before close. Session context, fetch path and TTL use the same window. Non-default windows return a `-session-override` calendar version so clients using the published standard calendar will block settlement instead of treating custom sessions as standard closes.
+
+Legacy US KV entries without this metadata are refreshed once under the existing bounded sync-fetch budget; a known false flag is not repeatedly refetched until normal expiry. Provider errors retain ordinary cache display behavior while settlement remains blocked.

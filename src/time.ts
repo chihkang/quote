@@ -1,3 +1,4 @@
+import { isMarketTradingDay, sessionCloseMinutes } from './marketCalendar';
 export type TimeParts = {
   weekday: number; // 1 = Monday ... 7 = Sunday
   hour: number;
@@ -103,21 +104,6 @@ function isWithinSessionWindow(parts: TimeParts, window: SessionWindow): boolean
   return minutes >= window.openMinutes && minutes <= window.closeMinutes;
 }
 
-function getDaysUntilNextWeekdayOpen(
-  weekday: number,
-  nowMinutes: number,
-  openMinutes: number
-): number {
-  if (isWeekday(weekday)) {
-    if (nowMinutes < openMinutes) {
-      return 0;
-    }
-    return weekday === 5 ? 3 : 1;
-  }
-
-  return weekday === 6 ? 2 : 1;
-}
-
 const US_MARKET_OPEN = parseTimeHHMM('09:30');
 const US_MARKET_WINDOW = getSessionWindow('09:30', '16:00');
 
@@ -127,7 +113,7 @@ function getDateTimeParts(date: Date, timeZone: string): DateTimeParts {
   const year = Number(values.year ?? '1970');
   const month = Number(values.month ?? '1');
   const day = Number(values.day ?? '1');
-  const hour = Number(values.hour ?? '0');
+  const hour = Number(values.hour ?? '0') % 24;
   const minute = Number(values.minute ?? '0');
 
   return { weekday, year, month, day, hour, minute };
@@ -223,7 +209,7 @@ export function isTradingSessionTW(
   close = DEFAULT_TW_CLOSE
 ): boolean {
   const parts = getTaipeiParts(now);
-  return isTradingSessionTWParts(parts, open, close);
+  return isMarketTradingDay('TW', getTaipeiDateISO(now)) && isTradingSessionTWParts(parts, open, close);
 }
 
 export function secondsUntilNextTwOpen(
@@ -231,13 +217,16 @@ export function secondsUntilNextTwOpen(
   open = DEFAULT_TW_OPEN,
   bufferSec = 0
 ): number {
-  const parts = getTaipeiParts(now);
-  const openMinutes = toMinutes(parseTimeHHMM(open));
-  const nowMinutes = toMinutes(parts);
-  const daysUntilOpen = getDaysUntilNextWeekdayOpen(parts.weekday, nowMinutes, openMinutes);
-
-  const minutesUntil = daysUntilOpen * 1440 + (openMinutes - nowMinutes);
-  return Math.max(0, minutesUntil * 60 + bufferSec);
+  const parts = getDateTimeParts(now, TAIPEI_TIME_ZONE);
+  const openParts = parseTimeHHMM(open);
+  for (let dayOffset = 0; dayOffset <= 30; dayOffset += 1) {
+    const candidate = addDaysToDateParts(parts, dayOffset, TAIPEI_TIME_ZONE);
+    if (!isMarketTradingDay('TW', formatDateIso(candidate))) continue;
+    const openAt = zonedDateTimeToUtc(candidate, openParts.hour, openParts.minute, TAIPEI_TIME_ZONE);
+    if (openAt <= now) continue;
+    return Math.max(0, Math.ceil((openAt.getTime() - now.getTime()) / 1000) + bufferSec);
+  }
+  return 0;
 }
 
 export function isTradingSessionUS(
@@ -246,7 +235,9 @@ export function isTradingSessionUS(
 ): boolean {
   const parts = getDateTimeParts(now, NEW_YORK_TIME_ZONE);
   const holidaySet = parseHolidayList(holidays);
-  return isTradingDay(parts, holidaySet) && isWithinSessionWindow(parts, US_MARKET_WINDOW);
+  return isMarketTradingDay('US', formatDateIso(parts)) && isTradingDay(parts, holidaySet)
+    && toMinutes(parts) >= US_MARKET_WINDOW.openMinutes
+    && toMinutes(parts) <= sessionCloseMinutes('US', formatDateIso(parts));
 }
 
 export function secondsUntilNextUsOpen(
@@ -264,14 +255,14 @@ export function secondsUntilNextUsOpen(
     day: currentParts.day
   };
 
-  for (let dayOffset = 0; dayOffset <= 7; dayOffset += 1) {
+  for (let dayOffset = 0; dayOffset <= 30; dayOffset += 1) {
     const candidateDate = addDaysToDateParts(currentDate, dayOffset, NEW_YORK_TIME_ZONE);
     if (dayOffset === 0 && nowMinutes >= openMinutes) {
       continue;
     }
 
     const openAt = zonedDateTimeToUtc(candidateDate, US_MARKET_OPEN.hour, US_MARKET_OPEN.minute, NEW_YORK_TIME_ZONE);
-    if (!isTradingDay(getDateTimeParts(openAt, NEW_YORK_TIME_ZONE), holidaySet)) {
+    if (!isMarketTradingDay('US', formatDateIso(candidateDate)) || !isTradingDay(getDateTimeParts(openAt, NEW_YORK_TIME_ZONE), holidaySet)) {
       continue;
     }
 

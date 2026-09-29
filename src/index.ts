@@ -1,3 +1,4 @@
+import { marketCalendar, resolveMarketCloseContext, isValidTwWindow } from './marketCalendar';
 import { l1Get, l1Set } from './l1Cache';
 import { getQuote, putQuote, type QuoteCacheValue } from './kvCache';
 import { classify, isStale } from './quotePolicy';
@@ -6,8 +7,7 @@ import {
 	getNewYorkDateISO,
 	getTaipeiDateISO,
 	getTaipeiParts,
-	isTradingSessionTW,
-	parseTimeHHMM
+	isTradingSessionTW
 } from './time';
 import { getTtlSeconds } from './ttl';
 import {
@@ -56,6 +56,7 @@ type QuoteResult = {
 	price: number | null;
 	currency: string | null;
 	asOf: string | null;
+	sourceTimestampVerified?: boolean;
 	fetchedAt: string | null;
 	ttlHardSec: number | null;
 	expiresAt: string | null;
@@ -168,15 +169,6 @@ function getProvisionalSourceTradingDate(
 
 	const fetchedAtDate = parseDate(fetchedAt);
 	return fetchedAtDate ? getTaipeiDateISO(fetchedAtDate) : null;
-}
-
-function isAfterTwRegularClose(now: Date, close: string): boolean {
-	const parts = getTaipeiParts(now);
-	if (parts.weekday < 1 || parts.weekday > 5) return false;
-	const closeParts = parseTimeHHMM(close);
-	const nowMinutes = parts.hour * 60 + parts.minute;
-	const closeMinutes = closeParts.hour * 60 + closeParts.minute;
-	return nowMinutes > closeMinutes;
 }
 
 function extractQuote(data: any): ExtractedQuote {
@@ -293,6 +285,7 @@ async function buildFromCache(
 		price: cached.price,
 		currency: cached.currency,
 		asOf: cached.asOf,
+		sourceTimestampVerified: cached.sourceTimestampVerified ?? false,
 		fetchedAt: cached.fetchedAt,
 		ttlHardSec: cached.ttlHardSec ?? null,
 		expiresAt: cached.expiresAt ?? null,
@@ -404,6 +397,7 @@ function buildFreshQuoteResult(
 		price: cacheValue.price,
 		currency: cacheValue.currency,
 		asOf: cacheValue.asOf,
+		sourceTimestampVerified: cacheValue.sourceTimestampVerified ?? false,
 		fetchedAt: cacheValue.fetchedAt,
 		ttlHardSec: cacheValue.ttlHardSec ?? null,
 		expiresAt: cacheValue.expiresAt ?? null,
@@ -584,8 +578,17 @@ export default {
 		const now = new Date();
 		const nowMs = now.getTime();
 		const twClose = env.TW_CLOSE ?? '13:30';
+		if (!isValidTwWindow({open: env.TW_OPEN ?? '09:00', close: twClose})) {
+			return errorResponse('Invalid TW trading session window', 400);
+		}
 		const twTrading = isTradingSessionTW(now, env.TW_OPEN ?? '09:00', twClose);
-		const twPostClose = isAfterTwRegularClose(now, twClose);
+		const extraHolidays = (env.US_HOLIDAYS ?? '').split(',').map(day => day.trim())
+			.filter(day => day && !marketCalendar.US.holidays.includes(day));
+		const requestCalendar = extraHolidays.length > 0 ? { ...marketCalendar, calendarVersion: marketCalendar.calendarVersion + '-override', US: { ...marketCalendar.US,
+						holidays: [...marketCalendar.US.holidays, ...extraHolidays]
+		} } : marketCalendar;
+		const twContext = resolveMarketCloseContext('TW', now, requestCalendar, {open: env.TW_OPEN ?? '09:00', close: twClose});
+		const twPostClose = twContext.marketSessionState === 'post_close';
 		const l1TtlSec = toNumber(env.L1_TTL_SEC, 20);
 		const maxSyncFetch = toNumber(env.MAX_SYNC_FETCH, 10);
 
@@ -670,7 +673,7 @@ export default {
 							'TW_EOD_OFFHOURS',
 							'fresh',
 							targetTradingDate,
-							targetTradingDate
+							twContext.expectedCloseTradingDate ?? targetTradingDate
 						)
 					: await buildMissing(item, 'TW_EOD_NOT_CONFIGURED', targetTradingDate);
 				if (eodResult.closeKind === 'official_eod') {
@@ -692,7 +695,7 @@ export default {
 
 			// Outside TW trading hours before close resolution, preserve the existing latest-EOD fallback.
 			if (item.market === 'TW' && !twTrading && env.TW_EOD_R2) {
-				const eodResult = await buildFromTwEodChain(item, 'TW_EOD_OFFHOURS', 'fresh', targetTradingDate);
+				const eodResult = await buildFromTwEodChain(item, 'TW_EOD_OFFHOURS', 'fresh', targetTradingDate, twContext.expectedCloseTradingDate ?? 'unknown');
 				if (eodResult.reason !== 'TW_EOD_MISS') {
 					l1Set(item.kvKey, eodResult, l1TtlSec, nowMs);
 				}
@@ -701,7 +704,7 @@ export default {
 			}
 
 			const l1Hit = l1Get<QuoteResult>(item.kvKey, nowMs);
-			if (l1Hit) {
+			if (l1Hit && !(item.market === 'US' && l1Hit.sourceTimestampVerified === undefined)) {
 				results[i] = l1Hit;
 				continue;
 			}
@@ -729,6 +732,12 @@ export default {
 				cached,
 				targetTradingDate
 			);
+
+			if (item.market === 'US' && cached.sourceTimestampVerified === undefined && cachedResult.status !== 'missing') {
+				results[i] = cachedResult;
+				missingForFetch.push({index: i, item, reason: 'LEGACY_SOURCE_TIME', targetTradingDate, closeResolution: false});
+				continue;
+			}
 
 			if (cachedResult.status === 'missing') {
 				results[i] = { ...cachedResult, reason: 'HARD_EXPIRED' };
@@ -790,7 +799,7 @@ export default {
 						results[index] = await buildMissing(
 							item,
 							'TW_PROVISIONAL_SOURCE_DATE_MISMATCH',
-							targetTradingDate
+							twContext.expectedCloseTradingDate ?? targetTradingDate
 						);
 						continue;
 					}
@@ -866,7 +875,8 @@ export default {
 								market: item.market,
 								price,
 								currency,
-								asOf: asOf ?? fetchedAt,
+								asOf,
+								sourceTimestampVerified: asOf !== null,
 								fetchedAt,
 								ttlHardSec: ttl.hard,
 								expiresAt: computeExpiresAt(fetchedAt, ttl.hard),
@@ -899,7 +909,10 @@ export default {
 
 		return jsonResponse({
 			serverTime: now.toISOString(),
-			results
+			results: results.map(result => ({ ...result,
+				targetTradingDate: getMarketDateISO(result.market, now),
+				...resolveMarketCloseContext(result.market, now, requestCalendar, {open: env.TW_OPEN ?? '09:00', close: twClose})
+			}))
 		});
 	},
 
@@ -911,7 +924,7 @@ export default {
 				scheduledTime: new Date(event.scheduledTime).toISOString(),
 				now: now.toISOString()
 			});
-			if (!shouldRunTwEodRefresh(now)) {
+			if (!shouldRunTwEodRefresh(now) || resolveMarketCloseContext('TW', now, marketCalendar, {open: env.TW_OPEN ?? '09:00', close: env.TW_CLOSE ?? '13:30'}).marketSessionState !== 'post_close') {
 				console.log('TWSE/TPEX EOD refresh skipped by local time window', { now: now.toISOString() });
 				return;
 			}

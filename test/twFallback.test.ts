@@ -121,6 +121,22 @@ describe('TW EOD fallback behavior', () => {
 		expect(json.results[0].reason).toBe('TW_EOD_OFFHOURS');
 	});
 
+
+  it('carries the last completed official close through a holiday and preserves target date', async () => {
+    vi.setSystemTime(new Date('2026-09-28T06:00:00Z'));
+    const kv = createKv();
+    const r2 = createR2({ [TWSE_EOD_LATEST_KEY]: JSON.stringify(buildTwEodSnapshot({
+      tradingDate: '2026-09-24', fetchedAt: '2026-09-24T06:00:00Z'
+    })) });
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+    const response = await callTwBatch(makeEnv({ kv, r2 }), ['2330']);
+    const json = await response.json() as any;
+    expect(json.results[0]).toMatchObject({ closeKind: 'official_eod', price: 1080,
+      sourceTradingDate: '2026-09-24', targetTradingDate: '2026-09-28',
+      expectedCloseTradingDate: '2026-09-24', marketSessionState: 'closed',
+      calendarVersion: 'twse-nyse-2026-v1' });
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
 	it('returns official EOD close after close even when quote cache has an earlier value', async () => {
 		vi.setSystemTime(new Date('2026-02-10T06:00:00.000Z')); // 14:00 Asia/Taipei
 		const kv = createKv({
