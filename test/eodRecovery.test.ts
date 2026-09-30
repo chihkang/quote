@@ -39,3 +39,21 @@ it('reports incomplete archive even when only one board exists', async () => {
 	expect(await response.json()).toMatchObject({ complete: false, expectedTradingDate: '2026-09-24',
 		boards: { TWSE: { available: false }, TPEX: { available: true } } });
 });
+it('repairs same-date partial publication and preserves it against a smaller retry', async () => {
+	vi.useFakeTimers(); vi.setSystemTime(new Date('2026-09-30T08:00:00Z'));
+	const { env, objects } = setup();
+	await worker.fetch(request('1150930'), env);
+	const complete = new Request('https://fixture.invalid/admin/tpex/eod/ingest', {
+		method: 'POST', headers: { Authorization: 'Bearer fixture-secret' },
+		body: JSON.stringify([
+			{ Date: '1150930', SecuritiesCompanyCode: '6488', Close: '101' },
+			{ Date: '1150930', SecuritiesCompanyCode: '5347', Close: '90' }
+		])
+	});
+	expect(await (await worker.fetch(complete, env)).json()).toMatchObject({ updated: true, quoteCount: 2 });
+	const saved = JSON.parse(objects.get('tpex/eod/2026-09-30.json')!);
+	expect(saved.quotes['6488'].close).toBe(101);
+	expect(saved.quotes['5347'].close).toBe(90);
+	await worker.fetch(request('1150930'), env);
+	expect(JSON.parse(objects.get('tpex/eod/2026-09-30.json')!).quotes).toEqual(saved.quotes);
+});

@@ -2,6 +2,8 @@ name: Archive official TPEX closes
 on:
   workflow_dispatch:
   schedule:
+    # Retry yesterday's publication before the next close advances the expected date.
+    - cron: '17,47 22-23,0-4 * * *'
     # UTC: Taipei 14:07-22:37, including holidays to retry delayed publication.
     - cron: '7,37 6-14 * * *'
     # Final daily completeness check: Taipei 23:47.

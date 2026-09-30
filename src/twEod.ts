@@ -273,7 +273,14 @@ async function persistSnapshot(
 
 	const latest = await readLatestSnapshot(env, board);
 	if (snapshot.tradingDate > getTaipeiDateISO(now)) throw new Error('Future source trading date');
-	if (latest && latest.tradingDate === snapshot.tradingDate) {
+	const sameDate = latest?.tradingDate === snapshot.tradingDate;
+	const incomingKeys = Object.keys(snapshot.quotes);
+	// A later full publication can add missing securities and correct prices. Do not
+	// replace a fuller archive with a truncated response from the same source day.
+	const preservesCoverage = !latest || Object.keys(latest.quotes).every(key => key in snapshot.quotes);
+	const identicalQuotes = latest && incomingKeys.length === Object.keys(latest.quotes).length
+		&& incomingKeys.every(key => JSON.stringify(snapshot.quotes[key]) === JSON.stringify(latest.quotes[key]));
+	if (latest && sameDate && (!preservesCoverage || identicalQuotes)) {
 		if (!await env.TW_EOD_R2.get(getDateKey(board, latest.tradingDate))) {
 			await env.TW_EOD_R2.put(getDateKey(board, latest.tradingDate), JSON.stringify(latest),
 				{ httpMetadata: { contentType: 'application/json' } });
@@ -293,7 +300,7 @@ async function persistSnapshot(
 	const body = JSON.stringify(snapshot);
 	await env.TW_EOD_R2.put(getDateKey(board, snapshot.tradingDate), body,
 		{ httpMetadata: { contentType: 'application/json' } });
-	if (!latest || snapshot.tradingDate > latest.tradingDate) {
+	if (!latest || snapshot.tradingDate >= latest.tradingDate) {
 		await env.TW_EOD_R2.put(getLatestKey(board), body, { httpMetadata: { contentType: 'application/json' } });
 	}
 

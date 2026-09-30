@@ -358,14 +358,14 @@ Environment variables are defined in [wrangler.jsonc](wrangler.jsonc). Key setti
 	- `tpex/eod/YYYY-MM-DD.json`
 - Each source is refreshed independently (partial success allowed).
 - TPEX refresh attempts OpenAPI first, then the legacy JSON endpoint. Both failing is reported as a partial refresh failure, even when a previous snapshot exists.
-- On the same trading date, refresh is idempotent (`updated: false`) and does not rewrite that source snapshot.
+- Identical same-date data is idempotent (`updated: false`). Later same-date publication can fill missing securities or correct values if it preserves the existing symbol coverage; a truncated response cannot replace a fuller archive.
 - Dated snapshots are retained without automatic deletion. `latest.json` points to the newest collected source date. Verify the R2 bucket lifecycle does not separately expire these objects. This accumulates available evidence; it cannot restore dates never collected.
 
 ### Independent TPEX collector and completeness check
 
 Cloudflare egress may be rejected by TPEX. `.github/workflows/archive-tpex.yml` independently downloads the public official OpenAPI on GitHub Actions and uploads the unchanged JSON to `POST /admin/tpex/eod/ingest`. This runs without anyone opening the App. The importer requires one consistent, valid source date matching the expected completed Taiwan session and at least one positive close.
 
-Configure a dedicated random `EOD_INGEST_TOKEN` secret in both Worker and GitHub, and the GitHub variable `QUOTE_WORKER_URL`. The token grants only TPEX ingestion; it is never sent to the official provider. Publish the workflow on the default branch to enable scheduled runs. Polling is Taipei 14:07–22:37 every half hour; a final 23:47 run also checks completeness. Manual dispatch performs the same final check. GitHub schedules can be delayed or disabled by platform policy; monitor failed runs and schedule activity.
+Configure a dedicated random `EOD_INGEST_TOKEN` secret in both Worker and GitHub, and the GitHub variable `QUOTE_WORKER_URL`. The token grants only TPEX ingestion; it is never sent to the official provider. Publish the workflow on the default branch to enable scheduled runs. Polling is Taipei 14:07–22:37 every half hour; a final 23:47 run also checks completeness. Morning retries at 06:17–12:47 recover late publications before the next close. Manual dispatch performs the same final check. GitHub schedules can be delayed or disabled by platform policy; monitor failed runs and schedule activity.
 
 `GET /health/eod` reads dated R2 objects for the calendar's expected completed session. It returns source dates, fetched times, positive-close counts and `complete`, with HTTP 503 when either board is absent. A successful upload of one board is not proof both boards are complete. A stale publication can be retried by polling; the final run fails if the archive is still incomplete. Worker schedules also log incompleteness. No portfolio information is collected.
 
