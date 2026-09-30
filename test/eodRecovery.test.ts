@@ -57,3 +57,26 @@ it('repairs same-date partial publication and preserves it against a smaller ret
 	await worker.fetch(request('1150930'), env);
 	expect(JSON.parse(objects.get('tpex/eod/2026-09-30.json')!).quotes).toEqual(saved.quotes);
 });
+
+it('recovers the previous session next morning and rejects it after the new close', async () => {
+	vi.useFakeTimers(); vi.setSystemTime(new Date('2026-09-29T22:17:00Z'));
+	const { env, objects } = setup();
+	expect((await worker.fetch(request('1150929'), env)).status).toBe(200);
+	expect(objects.has('tpex/eod/2026-09-29.json')).toBe(true);
+	vi.setSystemTime(new Date('2026-09-30T06:00:00Z'));
+	expect((await worker.fetch(request('1150929'), env)).status).toBe(409);
+	expect(objects.has('tpex/eod/2026-09-30.json')).toBe(false);
+	expect((await worker.fetch(request('1150930'), env)).status).toBe(200);
+	expect(objects.has('tpex/eod/2026-09-29.json')).toBe(true);
+	expect(objects.has('tpex/eod/2026-09-30.json')).toBe(true);
+});
+
+it('blocks import and health confirmation outside calendar coverage', async () => {
+	vi.useFakeTimers(); vi.setSystemTime(new Date('2027-01-15T08:00:00Z'));
+	const { env, objects } = setup();
+	expect((await worker.fetch(request('1160115'), env)).status).toBe(503);
+	expect(objects.size).toBe(0);
+	const health = await worker.fetch(new Request('https://fixture.invalid/health/eod'), env);
+	expect(health.status).toBe(503);
+	expect(await health.json()).toMatchObject({ complete: false, expectedTradingDate: null });
+});
