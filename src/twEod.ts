@@ -144,7 +144,8 @@ function parseTradingDate(raw: string): string | null {
 		const month = Number(digits.slice(4, 6));
 		const day = Number(digits.slice(6, 8));
 		if (year > 1900 && month >= 1 && month <= 12 && day >= 1 && day <= 31) {
-			return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+			const value = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+			return new Date(value).toISOString().slice(0, 10) === value ? value : null;
 		}
 	}
 
@@ -154,7 +155,8 @@ function parseTradingDate(raw: string): string | null {
 		const day = Number(digits.slice(5, 7));
 		if (rocYear > 0 && month >= 1 && month <= 12 && day >= 1 && day <= 31) {
 			const year = rocYear + 1911;
-			return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+			const value = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+			return new Date(value).toISOString().slice(0, 10) === value ? value : null;
 		}
 	}
 
@@ -259,37 +261,6 @@ async function getLatestSnapshot(
 	return snapshot;
 }
 
-async function cleanupStaleSnapshots(env: EnvWithTwEod, board: Board, keepTradingDate: string): Promise<number> {
-	if (!env.TW_EOD_R2) return 0;
-
-	const keep = new Set<string>([getLatestKey(board), getDateKey(board, keepTradingDate)]);
-	const prefix = `${board.toLowerCase()}/eod/`;
-	const staleKeys: string[] = [];
-	let cursor: string | undefined;
-
-	do {
-		const listed = await env.TW_EOD_R2.list({
-			prefix,
-			cursor
-		});
-
-		for (const object of listed.objects) {
-			const key = object.key;
-			if (keep.has(key)) continue;
-
-			const suffix = key.slice(prefix.length);
-			if (!/^\d{4}-\d{2}-\d{2}\.json$/.test(suffix)) continue;
-			staleKeys.push(key);
-		}
-
-		cursor = listed.truncated ? listed.cursor : undefined;
-	} while (cursor);
-
-	if (staleKeys.length === 0) return 0;
-	await env.TW_EOD_R2.delete(staleKeys);
-	return staleKeys.length;
-}
-
 async function persistSnapshot(
 	env: EnvWithTwEod,
 	board: Board,
@@ -301,8 +272,12 @@ async function persistSnapshot(
 	}
 
 	const latest = await readLatestSnapshot(env, board);
+	if (snapshot.tradingDate > getTaipeiDateISO(now)) throw new Error('Future source trading date');
 	if (latest && latest.tradingDate === snapshot.tradingDate) {
-		const deletedCount = await cleanupStaleSnapshots(env, board, latest.tradingDate);
+		if (!await env.TW_EOD_R2.get(getDateKey(board, latest.tradingDate))) {
+			await env.TW_EOD_R2.put(getDateKey(board, latest.tradingDate), JSON.stringify(latest),
+				{ httpMetadata: { contentType: 'application/json' } });
+		}
 		caches[board] = {
 			snapshot: latest,
 			expiresAtMs: now.getTime() + getL1TtlSec(env) * 1000
@@ -311,23 +286,19 @@ async function persistSnapshot(
 			updated: false,
 			tradingDate: latest.tradingDate,
 			quoteCount: Object.keys(latest.quotes).length,
-			deletedCount
+			deletedCount: 0
 		};
 	}
 
 	const body = JSON.stringify(snapshot);
-	await Promise.all([
-		env.TW_EOD_R2.put(getLatestKey(board), body, {
-			httpMetadata: { contentType: 'application/json' }
-		}),
-		env.TW_EOD_R2.put(getDateKey(board, snapshot.tradingDate), body, {
-			httpMetadata: { contentType: 'application/json' }
-		})
-	]);
+	await env.TW_EOD_R2.put(getDateKey(board, snapshot.tradingDate), body,
+		{ httpMetadata: { contentType: 'application/json' } });
+	if (!latest || snapshot.tradingDate > latest.tradingDate) {
+		await env.TW_EOD_R2.put(getLatestKey(board), body, { httpMetadata: { contentType: 'application/json' } });
+	}
 
-	const deletedCount = await cleanupStaleSnapshots(env, board, snapshot.tradingDate);
 	caches[board] = {
-		snapshot,
+		snapshot: latest && latest.tradingDate > snapshot.tradingDate ? latest : snapshot,
 		expiresAtMs: now.getTime() + getL1TtlSec(env) * 1000
 	};
 
@@ -335,7 +306,7 @@ async function persistSnapshot(
 		updated: true,
 		tradingDate: snapshot.tradingDate,
 		quoteCount: Object.keys(snapshot.quotes).length,
-		deletedCount
+		deletedCount: 0
 	};
 }
 
@@ -368,9 +339,9 @@ export function parseTwseStockDayAllCsv(
 		const rawSymbol = (row[symbolIndex] ?? '').trim().toUpperCase();
 		if (!rawSymbol) continue;
 
-		if (!tradingDate) {
-			tradingDate = parseTradingDate(row[dateIndex] ?? '');
-		}
+		const rowDate = parseTradingDate(row[dateIndex] ?? '');
+		if (!rowDate || (tradingDate && rowDate !== tradingDate)) throw new Error('TWSE missing or mixed trading dates');
+		tradingDate = rowDate;
 
 		let symbol = rawSymbol;
 		if (dataRowIndex < patchRows && !symbol.startsWith('00')) {
@@ -384,7 +355,7 @@ export function parseTwseStockDayAllCsv(
 	}
 
 	if (!tradingDate) {
-		tradingDate = getTaipeiDateISO(new Date(fetchedAt));
+		throw new Error('Missing source trading date');
 	}
 
 	return {
@@ -422,8 +393,8 @@ function parseTpexLegacyPayload(payload: TpexPayload, fetchedAt: string): TwEodS
 
 	const tradingDate =
 		parseTradingDate(payload.date ?? '') ??
-		parseTradingDate(table.date ?? '') ??
-		getTaipeiDateISO(new Date(fetchedAt));
+		parseTradingDate(table.date ?? '');
+	if (!tradingDate || Object.keys(quotes).length === 0) throw new Error('TPEX missing trading date or quotes');
 
 	return {
 		tradingDate,
@@ -444,9 +415,9 @@ function parseTpexOpenApiPayload(rows: TpexOpenApiRow[], fetchedAt: string): TwE
 		const rawSymbol = String(row.SecuritiesCompanyCode ?? '').trim().toUpperCase();
 		if (!rawSymbol) continue;
 
-		if (!tradingDate) {
-			tradingDate = parseTradingDate(String(row.Date ?? ''));
-		}
+		const rowDate = parseTradingDate(String(row.Date ?? ''));
+		if (!rowDate || (tradingDate && rowDate !== tradingDate)) throw new Error('TPEX missing or mixed trading dates');
+		tradingDate = rowDate;
 
 		const close = parseClosePrice(String(row.Close ?? ''));
 		const name = String(row.CompanyName ?? '').trim() || null;
@@ -454,7 +425,7 @@ function parseTpexOpenApiPayload(rows: TpexOpenApiRow[], fetchedAt: string): TwE
 	}
 
 	if (!tradingDate) {
-		tradingDate = getTaipeiDateISO(new Date(fetchedAt));
+		throw new Error('Missing source trading date');
 	}
 
 	return {
@@ -500,6 +471,21 @@ export async function getLatestTpexEodSnapshot(
 	nowMs = Date.now()
 ): Promise<TwEodSnapshot | null> {
 	return getLatestSnapshot(env, 'TPEX', nowMs);
+}
+
+export async function getArchivedTwEodSnapshots(env: EnvWithTwEod, tradingDate: string): Promise<TwEodSnapshot[]> {
+	if (!env.TW_EOD_R2) return [];
+	const boards: Board[] = ['TWSE', 'TPEX'];
+	const snapshots = await Promise.all(boards.map(async (board) => {
+		const object = await env.TW_EOD_R2!.get(getDateKey(board, tradingDate));
+		if (!object) return null;
+		const snapshot = parseSnapshot(await object.json());
+		if (snapshot?.tradingDate !== tradingDate) return null;
+		if (board === 'TWSE' && snapshot.source !== 'TWSE_STOCK_DAY_ALL') return null;
+		if (board === 'TPEX' && !snapshot.source.startsWith('TPEX_')) return null;
+		return snapshot;
+	}));
+	return snapshots.filter((snapshot): snapshot is TwEodSnapshot => snapshot !== null);
 }
 
 export function getTwEodQuote(snapshot: TwEodSnapshot | null, ticker: string): TwEodQuote | null {
@@ -562,24 +548,22 @@ export async function refreshTpexEodSnapshot(env: EnvWithTwEod, now = new Date()
 
 	const latest = await readLatestSnapshot(env, 'TPEX');
 	if (latest) {
-		const deletedCount = await cleanupStaleSnapshots(env, 'TPEX', latest.tradingDate);
-		caches.TPEX = {
-			snapshot: latest,
-			expiresAtMs: now.getTime() + getL1TtlSec(env) * 1000
-		};
-
-		console.warn('TPEX EOD refresh failed, serving cached snapshot', {
+		console.warn('TPEX EOD refresh failed; archived snapshot remains available', {
 			tradingDate: latest.tradingDate,
 			errors
 		});
-
-		return {
-			updated: false,
-			tradingDate: latest.tradingDate,
-			quoteCount: Object.keys(latest.quotes).length,
-			deletedCount
-		};
 	}
 
 	throw new Error(`TPEX EOD fetch failed: ${errors.join(' | ')}`);
+}
+
+export async function ingestTpexEodSnapshot(env: EnvWithTwEod, payload: unknown, expectedDate: string,
+	now = new Date()): Promise<RefreshResult> {
+	if (!Array.isArray(payload)) throw new Error('Official OpenAPI rows required');
+	const snapshot = parseTpexDailyCloseJson(payload, now.toISOString());
+	if (snapshot.tradingDate !== expectedDate) throw new Error('Source date does not match expected completed session');
+	if (!Object.values(snapshot.quotes).some(quote => quote.close !== null && quote.close > 0)) {
+		throw new Error('No valid official closes');
+	}
+	return persistSnapshot(env, 'TPEX', snapshot, now);
 }

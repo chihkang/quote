@@ -342,7 +342,7 @@ Environment variables are defined in [wrangler.jsonc](wrangler.jsonc). Key setti
 - `TWSE_EOD_URL`: TWSE full-market close CSV URL.
 - `TPEX_EOD_URL`: Primary TPEX daily close source URL (default: OpenAPI `https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes`).
 	- Runtime fallback is built-in: if primary URL fails or redirects to non-JSON pages, Worker retries the legacy endpoint `https://www.tpex.org.tw/web/stock/aftertrading/DAILY_CLOSE_quotes/stk_quote_result.php?l=zh-tw&o=json`.
-	- If both upstream URLs fail but `tpex/eod/latest.json` exists, Worker keeps serving that cached snapshot and does not fail the whole refresh.
+	- If both upstream URLs fail, refresh reports a failure. Existing cached snapshots remain readable for their actual source date; they do not count as successful collection.
 - `TW_EOD_PATCH_ROWS`: Number of leading CSV rows to prepend `00` when symbol does not start with `00` (default `239`).
 - `TW_429_BLOCK_SEC`: Fugle 429 cooldown seconds before retrying paid API (default `60`).
 - `TW_EOD_L1_SEC`: In-memory TTL (seconds) for cached TWSE/TPEX EOD snapshot reads from R2.
@@ -350,17 +350,30 @@ Environment variables are defined in [wrangler.jsonc](wrangler.jsonc). Key setti
 
 ### Scheduled refresh
 
-- `wrangler.jsonc` defines weekday cron triggers to refresh TWSE/TPEX EOD snapshots after close.
-- Worker code additionally gates refresh by Asia/Taipei local time window: weekdays `13:40-18:59`, and requires a post-close session in the Taiwan calendar; published holidays are skipped.
+- `wrangler.jsonc` triggers every ten minutes. Collection runs during Asia/Taipei `06:00-08:59` and `13:40-23:59`, including holidays to retry delayed publication. Calendar coverage is required.
 - Scheduled job fetches both sources and writes separate snapshots:
 	- `twse/eod/latest.json`
 	- `twse/eod/YYYY-MM-DD.json`
 	- `tpex/eod/latest.json`
 	- `tpex/eod/YYYY-MM-DD.json`
 - Each source is refreshed independently (partial success allowed).
-- TPEX refresh attempts OpenAPI first, then the legacy JSON endpoint, and finally falls back to existing `tpex/eod/latest.json` if both upstream requests fail.
+- TPEX refresh attempts OpenAPI first, then the legacy JSON endpoint. Both failing is reported as a partial refresh failure, even when a previous snapshot exists.
 - On the same trading date, refresh is idempotent (`updated: false`) and does not rewrite that source snapshot.
-- Retention policy is one-in/one-out per source: each source keeps only `latest.json` and the current trading-date file.
+- Dated snapshots are retained without automatic deletion. `latest.json` points to the newest collected source date. Verify the R2 bucket lifecycle does not separately expire these objects. This accumulates available evidence; it cannot restore dates never collected.
+
+### Independent TPEX collector and completeness check
+
+Cloudflare egress may be rejected by TPEX. `.github/workflows/archive-tpex.yml` independently downloads the public official OpenAPI on GitHub Actions and uploads the unchanged JSON to `POST /admin/tpex/eod/ingest`. This runs without anyone opening the App. The importer requires one consistent, valid source date matching the expected completed Taiwan session and at least one positive close.
+
+Configure a dedicated random `EOD_INGEST_TOKEN` secret in both Worker and GitHub, and the GitHub variable `QUOTE_WORKER_URL`. The token grants only TPEX ingestion; it is never sent to the official provider. Publish the workflow on the default branch to enable scheduled runs. Polling is Taipei 14:07–22:37 every half hour; a final 23:47 run also checks completeness. Manual dispatch performs the same final check. GitHub schedules can be delayed or disabled by platform policy; monitor failed runs and schedule activity.
+
+`GET /health/eod` reads dated R2 objects for the calendar's expected completed session. It returns source dates, fetched times, positive-close counts and `complete`, with HTTP 503 when either board is absent. A successful upload of one board is not proof both boards are complete. A stale publication can be retried by polling; the final run fails if the archive is still incomplete. Worker schedules also log incompleteness. No portfolio information is collected.
+
+### Archived Taiwan closes
+
+`POST /quotes/close-by-date` accepts `{"valuationDate":"2026-09-24","symbols":["2330"]}`. It reads only saved TWSE/TPEX dated snapshots for the completed trading session applicable to that Taiwan valuation date. Each result includes the raw close, `sourceTradingDate`, `expectedCloseTradingDate`, `calendarVersion`, `closeKind=official_eod`, and `source` (for example `TWSE_STOCK_DAY_ALL`); an absent or invalid close returns `price=null`. No live historical site is queried and no intraday quote is treated as a close. The endpoint is limited by `MAX_SYMBOLS_PER_REQUEST` (10 by default).
+
+Taiwan close data is sourced from the Taiwan Stock Exchange and Taipei Exchange open data. Display attribution when using these values. Existing dates outside the archive remain unavailable.
 
 ### Tests
 
@@ -382,7 +395,7 @@ Contributions are welcome via pull requests. Please include tests for new behavi
 
 ## Settlement calendar context
 
-Batch results add nullable `expectedCloseTradingDate` and `calendarVersion`, plus `marketSessionState` (`pre_open`, `open`, `post_close`, `closed`). Existing `targetTradingDate` remains the request's market-local civil date. Holidays may legitimately have an earlier source date matching the expected completed session. A real trading day after close still requires its own source date. The bundled calendar covers December 2025–December 2026; unknown coverage returns no expected close. See [ADR 0002](docs/adr/0002-completed-market-session-context.md). No historical quote endpoint is implied.
+Batch results add nullable `expectedCloseTradingDate` and `calendarVersion`, plus `marketSessionState` (`pre_open`, `open`, `post_close`, `closed`). Existing `targetTradingDate` remains the request's market-local civil date. Holidays may legitimately have an earlier source date matching the expected completed session. A real trading day after close still requires its own source date. The bundled calendar covers December 2025–December 2026; unknown coverage returns no expected close. See [ADR 0002](docs/adr/0002-completed-market-session-context.md). Archived Taiwan closes can be read through `/quotes/close-by-date` while their dated snapshots are retained.
 
 US quote responses preserve the provider's raw timestamp. `sourceTimestampVerified` is false for legacy caches or missing provider time; `fetchedAt` is never substituted for a missing US `asOf`. These quotes remain usable by ordinary displays but cannot prove a completed close.
 

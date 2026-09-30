@@ -13,6 +13,7 @@ import { getTtlSeconds } from './ttl';
 import {
 	getLatestTpexEodSnapshot,
 	getLatestTwseEodSnapshot,
+	getArchivedTwEodSnapshots,
 	getTwEodQuote,
 	refreshTpexEodSnapshot,
 	refreshTwseEodSnapshot,
@@ -20,7 +21,10 @@ import {
 	type TwEodSnapshot
 } from './twEod';
 
+import { eodHealth, ingestTpex } from './eodRecovery';
+
 export type Env = {
+	EOD_INGEST_TOKEN?: string;
 	QUOTES_KV: KVNamespace;
 	FUGLE_API_KEY: string;
 	FINNHUB_API_KEY: string;
@@ -65,6 +69,7 @@ type QuoteResult = {
 	reason: string | null;
 	closeKind: CloseKind;
 	sourceTradingDate: string | null;
+	source?: string | null;
 	targetTradingDate: string;
 };
 
@@ -136,6 +141,10 @@ function eodAsOf(tradingDate: string): string | null {
 	const iso = new Date(`${tradingDate}T13:30:00+08:00`);
 	if (Number.isNaN(iso.getTime())) return null;
 	return iso.toISOString();
+}
+
+function withoutFractionalSeconds(value: string): string {
+	return value.replace(/\.\d{3}Z$/, 'Z');
 }
 
 function parseDate(value: string | null | undefined): Date | null {
@@ -368,6 +377,7 @@ function buildFromTwEod(
 		reason: hitReason,
 		closeKind: 'official_eod',
 		sourceTradingDate: snapshot.tradingDate,
+		source: snapshot.source,
 		targetTradingDate
 	};
 }
@@ -431,9 +441,10 @@ async function setTwFugleBlockUntilMs(env: Env, baseMs: number, blockSec: number
 
 function shouldRunTwEodRefresh(now = new Date()): boolean {
 	const parts = getTaipeiParts(now);
-	if (parts.weekday < 1 || parts.weekday > 5) return false;
+	// Include holidays and the next morning to collect delayed publication.
+	if (parts.hour >= 6 && parts.hour <= 8) return true;
 	if (parts.hour === 13) return parts.minute >= 40;
-	return parts.hour >= 14 && parts.hour <= 18;
+	return parts.hour >= 14 && parts.hour <= 23;
 }
 
 function getAdminTokenFromRequest(request: Request): string | null {
@@ -528,6 +539,8 @@ export default {
 		}
 
 		const pathname = new URL(request.url).pathname;
+		if (pathname === '/health/eod' && request.method === 'GET') return eodHealth(env);
+		if (pathname === '/admin/tpex/eod/ingest') return ingestTpex(request, env);
 		if (pathname === '/admin/twse/eod/refresh') {
 			if (request.method !== 'POST') {
 				return errorResponse('Method Not Allowed', 405);
@@ -537,6 +550,44 @@ export default {
 
 		if (request.method !== 'POST') {
 			return errorResponse('Method Not Allowed', 405);
+		}
+
+		if (pathname === '/quotes/close-by-date') {
+			let body: { valuationDate?: unknown; symbols?: unknown };
+			try { body = await request.json() as typeof body; }
+			catch { return errorResponse('Invalid JSON body', 400); }
+			const valuationDate = body.valuationDate;
+			const rawSymbols = body.symbols;
+			if (typeof valuationDate !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(valuationDate) ||
+				getTaipeiDateISO(new Date(`${valuationDate}T13:35:00+08:00`)) !== valuationDate ||
+				valuationDate > getTaipeiDateISO(new Date())) return errorResponse('Invalid valuationDate', 400);
+			if (!Array.isArray(rawSymbols) || rawSymbols.length === 0 ||
+				rawSymbols.length > toNumber(env.MAX_SYMBOLS_PER_REQUEST, 10) ||
+				!rawSymbols.every((symbol) => typeof symbol === 'string' && /^[A-Z0-9]{2,8}$/.test(symbol.trim().toUpperCase()))) {
+				return errorResponse('Invalid symbols', 400);
+			}
+			const context = resolveMarketCloseContext('TW', new Date(`${valuationDate}T13:35:00+08:00`));
+			const expected = context.expectedCloseTradingDate;
+			if (!expected || !context.calendarVersion) return errorResponse('Calendar unavailable', 422);
+			const snapshots = await getArchivedTwEodSnapshots(env, expected);
+			const results = rawSymbols.map((raw) => {
+				const symbol = String(raw).trim().toUpperCase();
+				const hits = snapshots.map((snapshot) => ({ snapshot, quote: getTwEodQuote(snapshot, symbol) }))
+					.filter((hit) => hit.quote?.close != null && Number.isFinite(hit.quote.close) && hit.quote.close > 0);
+				const hit = hits.length === 1 ? hits[0] : null;
+				return { symbol,
+					canonicalSymbol: `${symbol}.${hit?.snapshot.source.startsWith('TPEX_') ? 'TWO' : 'TW'}`,
+					market: 'TW',
+					price: hit?.quote?.close ?? null, currency: 'TWD',
+					asOf: hit ? withoutFractionalSeconds(eodAsOf(expected)!) : null,
+					fetchedAt: hit ? withoutFractionalSeconds(hit.snapshot.fetchedAt) : null,
+					ttlHardSec: null, expiresAt: null, status: hit ? 'stale' : 'missing', isStale: Boolean(hit),
+					reason: hit ? null : 'ARCHIVED_CLOSE_UNAVAILABLE', closeKind: hit ? 'official_eod' : 'unavailable',
+					sourceTradingDate: hit ? expected : null, targetTradingDate: valuationDate,
+					expectedCloseTradingDate: expected, marketSessionState: 'closed', calendarVersion: context.calendarVersion,
+					source: hit?.snapshot.source ?? null };
+			});
+			return jsonResponse({ serverTime: withoutFractionalSeconds(new Date().toISOString()), results });
 		}
 
 		if (pathname !== '/quotes/batch') {
@@ -924,7 +975,7 @@ export default {
 				scheduledTime: new Date(event.scheduledTime).toISOString(),
 				now: now.toISOString()
 			});
-			if (!shouldRunTwEodRefresh(now) || resolveMarketCloseContext('TW', now, marketCalendar, {open: env.TW_OPEN ?? '09:00', close: env.TW_CLOSE ?? '13:30'}).marketSessionState !== 'post_close') {
+			if (!shouldRunTwEodRefresh(now) || !resolveMarketCloseContext('TW', now).expectedCloseTradingDate) {
 				console.log('TWSE/TPEX EOD refresh skipped by local time window', { now: now.toISOString() });
 				return;
 			}
@@ -958,6 +1009,8 @@ export default {
 				ok: !hasRefreshError(twseResult as RefreshResponse) || !hasRefreshError(tpexResult as RefreshResponse),
 				partial: hasRefreshError(twseResult as RefreshResponse) !== hasRefreshError(tpexResult as RefreshResponse)
 			});
+			const health = await eodHealth(env, now);
+			if (!health.ok) console.error('Official EOD archive incomplete', await health.json());
 		} catch (error) {
 			console.error('TWSE/TPEX EOD refresh failed', error);
 		}

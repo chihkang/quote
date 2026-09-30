@@ -52,6 +52,16 @@ describe('parseTwseStockDayAllCsv', () => {
 });
 
 describe('parseTpexDailyCloseJson', () => {
+	it('rejects absent, impossible, and mixed source dates instead of using fetch time', () => {
+		const row = { SecuritiesCompanyCode: '6488', CompanyName: 'test', Close: '100' };
+		for (const Date of ['', '1150230']) {
+			expect(() => parseTpexDailyCloseJson([{ ...row, Date }])).toThrow();
+		}
+		expect(() => parseTpexDailyCloseJson([
+			{ ...row, Date: '1150929' }, { ...row, SecuritiesCompanyCode: '8069', Date: '1150930' }
+		])).toThrow();
+		expect(() => parseTwseStockDayAllCsv(buildCsv([{ date: '', symbol: '2330', name: 'test', close: '100' }]), 0)).toThrow();
+	});
 	it('parses tpex openapi rows and maps code to close', () => {
 		const payload = [
 			{

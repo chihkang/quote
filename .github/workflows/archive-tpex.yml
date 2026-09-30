@@ -1,0 +1,30 @@
+name: Archive official TPEX closes
+on:
+  workflow_dispatch:
+  schedule:
+    # UTC: Taipei 14:07-22:37, including holidays to retry delayed publication.
+    - cron: '7,37 6-14 * * *'
+    # Final daily completeness check: Taipei 23:47.
+    - cron: '47 15 * * *'
+permissions:
+  contents: read
+concurrency:
+  group: archive-tpex
+  cancel-in-progress: false
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Collect public official data and verify archive
+        env:
+          QUOTE_WORKER_URL: ${{ vars.QUOTE_WORKER_URL }}
+          EOD_INGEST_TOKEN: ${{ secrets.EOD_INGEST_TOKEN }}
+          FINAL_CHECK: ${{ github.event_name == 'workflow_dispatch' || github.event.schedule == '47 15 * * *' }}
+        run: |
+          if [ "$FINAL_CHECK" = "true" ]; then
+            node scripts/collect-tpex.mjs --require-complete
+          else
+            node scripts/collect-tpex.mjs
+          fi

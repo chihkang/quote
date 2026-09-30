@@ -109,7 +109,7 @@ describe('manual TWSE/TPEX EOD refresh endpoint', () => {
 		expect(response.status).toBe(401);
 	});
 
-	it('refreshes both sources, cleans stale files, and is idempotent on same trading date', async () => {
+	it('refreshes both sources, retains dated evidence, and is idempotent on same trading date', async () => {
 		const r2 = createR2({
 			'twse/eod/2026-02-09.json': JSON.stringify({
 				tradingDate: '2026-02-09',
@@ -122,7 +122,10 @@ describe('manual TWSE/TPEX EOD refresh endpoint', () => {
 				fetchedAt: '2026-02-09T06:00:00.000Z',
 				source: 'TPEX_STK_QUOTE_RESULT',
 				quotes: {}
-			})
+			}),
+			'twse/eod/2026-01-12.json': JSON.stringify({ tradingDate: '2026-01-12', fetchedAt: '2026-01-12T06:00:00.000Z', source: 'TWSE_STOCK_DAY_ALL', quotes: {} }),
+			'twse/eod/2026-01-11.json': JSON.stringify({ tradingDate: '2026-01-11', fetchedAt: '2026-01-11T06:00:00.000Z', source: 'TWSE_STOCK_DAY_ALL', quotes: {} }),
+			'twse/eod/2026-01-01.json': JSON.stringify({ tradingDate: '2026-01-01', fetchedAt: '2026-01-01T06:00:00.000Z', source: 'TWSE_STOCK_DAY_ALL', quotes: {} })
 		});
 		const env = buildEnv(r2, { ADMIN_REFRESH_TOKEN: 'secret-token' });
 		const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
@@ -148,14 +151,17 @@ describe('manual TWSE/TPEX EOD refresh endpoint', () => {
 		expect(firstJson.partial).toBe(false);
 		expect(firstJson.twse.updated).toBe(true);
 		expect(firstJson.twse.tradingDate).toBe('2026-02-10');
-		expect(firstJson.twse.deletedCount).toBe(1);
+		expect(firstJson.twse.deletedCount).toBe(0);
 		expect(firstJson.tpex.updated).toBe(true);
 		expect(firstJson.tpex.tradingDate).toBe('2026-02-10');
-		expect(firstJson.tpex.deletedCount).toBe(1);
+		expect(firstJson.tpex.deletedCount).toBe(0);
 		expect(r2.objects.has(TWSE_EOD_LATEST_KEY)).toBe(true);
 		expect(r2.objects.has(TPEX_EOD_LATEST_KEY)).toBe(true);
-		expect(r2.objects.has('twse/eod/2026-02-09.json')).toBe(false);
-		expect(r2.objects.has('tpex/eod/2026-02-09.json')).toBe(false);
+		expect(r2.objects.has('twse/eod/2026-02-09.json')).toBe(true);
+		expect(r2.objects.has('tpex/eod/2026-02-09.json')).toBe(true);
+		expect(r2.objects.has('twse/eod/2026-01-12.json')).toBe(true);
+		expect(r2.objects.has('twse/eod/2026-01-11.json')).toBe(true);
+		expect(r2.objects.has('twse/eod/2026-01-01.json')).toBe(true);
 
 		const second = await callManualRefresh(env, {
 			authorization: 'Bearer secret-token'
@@ -194,7 +200,7 @@ describe('manual TWSE/TPEX EOD refresh endpoint', () => {
 		expect(json.tpex.error).toMatch('TPEX EOD fetch failed');
 	});
 
-	it('uses cached TPEX snapshot when upstream redirects to error pages', async () => {
+	it('reports TPEX failure even when an older cached snapshot is available', async () => {
 		const r2 = createR2({
 			[TPEX_EOD_LATEST_KEY]: JSON.stringify({
 				tradingDate: '2026-02-10',
@@ -226,11 +232,12 @@ describe('manual TWSE/TPEX EOD refresh endpoint', () => {
 
 		expect(response.status).toBe(200);
 		expect(json.ok).toBe(true);
-		expect(json.partial).toBe(false);
-		expect(json.tpex.error).toBeUndefined();
+		expect(json.partial).toBe(true);
+		expect(json.tpex.error).toMatch('TPEX EOD fetch failed');
 		expect(json.tpex.updated).toBe(false);
-		expect(json.tpex.tradingDate).toBe('2026-02-10');
-		expect(json.tpex.quoteCount).toBe(1);
+		expect(json.tpex.tradingDate).toBeNull();
+		expect(json.tpex.quoteCount).toBe(0);
+		expect(r2.objects.has(TPEX_EOD_LATEST_KEY)).toBe(true);
 	});
 
 	it('falls back to legacy TPEX endpoint when OpenAPI is redirected', async () => {
