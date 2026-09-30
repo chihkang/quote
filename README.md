@@ -174,7 +174,7 @@ Manual refresh response now returns source-level results:
 - `partial`: only one source succeeded
 - `twse`: `{ updated, tradingDate, quoteCount, deletedCount, error? }`
 - `tpex`: `{ updated, tradingDate, quoteCount, deletedCount, error? }`
-	- `error` appears only when refresh fails and there is no usable snapshot for that source.
+	- `error` appears when that source's refresh fails, even if an older snapshot remains readable. Inspect its actual date; an existing cache does not prove the current refresh succeeded.
 
 ### Quote flow by market and session
 
@@ -370,6 +370,37 @@ An interrupted official download is retried up to three times per run (30-second
 Configure a dedicated random `EOD_INGEST_TOKEN` secret in both Worker and GitHub, and the GitHub variable `QUOTE_WORKER_URL`. The token grants only TPEX ingestion; it is never sent to the official provider. Publish the workflow on the default branch to enable scheduled runs. Polling is Taipei 14:07–22:37 every half hour; a final 23:47 run also checks completeness. Morning retries at 06:17–12:47 recover late publications before the next close. Manual dispatch performs the same final check. GitHub schedules can be delayed or disabled by platform policy; monitor failed runs and schedule activity.
 
 `GET /health/eod` reads dated R2 objects for the calendar's expected completed session. It returns source dates, fetched times, positive-close counts and `complete`, with HTTP 503 when either board is absent. A successful upload of one board is not proof both boards are complete. A stale publication can be retried by polling; the final run fails if the archive is still incomplete. Worker schedules also log incompleteness. No portfolio information is collected.
+
+Here `complete` means both expected-date archives contain positive prices, not that every listed security has a usable close. Consumers must still validate each requested symbol. An upstream download failure can stop the collector before its final health check; a failed run does not by itself mean existing R2 data was lost. Ingestion and health-check failures wait for the next scheduled run; the three short retries apply to the official download only.
+
+```text
+Worker cron -> TWSE official daily data -------------------------+
+            -> TPEX OpenAPI -> legacy JSON if request fails -----+
+                                                                 |
+GitHub cron -> TPEX OpenAPI (up to 3 download attempts)            |
+                       |                                         |
+                       v                                         |
+              authenticated Worker ingest -----------------------+
+                                                                 |
+                                                                 v
+                                               R2 dated snapshots + latest
+                                                                 |
+                          +--------------------------------------+
+                          |                                      |
+                          v                                      v
+                   /health/eod                      /quotes/close-by-date
+                   expected day                     saved official evidence
+                   both boards                                  |
+                          |                                      v
+                 incomplete -> 503                  App validates + previews
+                 final run fails                    user confirms historical write
+```
+
+Both cron paths operate independently of the App. They collect public market evidence; personal portfolio reconstruction happens in the App. Holidays resolve through the versioned market calendar and retain the actual earlier source date. Never-stored history and unsupported US historical prices remain unavailable.
+
+#### Interpreting a failed Actions notification
+
+This workflow collects data and checks archives; it does not deploy the Worker. Inspect the run's commit and failing step, then compare the latest run and `/health/eod`. Old failed runs and emails remain red after a fix. On 2026-09-30 the 16:17 Taipei run at `4258238` failed with `terminated` during HTTP collection; the log does not identify why the connection ended. Commit `d18cb6d` added bounded official-download retries, including response-body interruptions. The 16:19 run succeeded. The checkout Node-runtime deprecation warning in those logs is separate from the collection error.
 
 ### Archived Taiwan closes
 
