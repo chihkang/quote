@@ -365,6 +365,8 @@ Environment variables are defined in [wrangler.jsonc](wrangler.jsonc). Key setti
 
 Cloudflare egress may be rejected by TPEX. `.github/workflows/archive-tpex.yml` independently downloads the public official OpenAPI on GitHub Actions and uploads the unchanged JSON to `POST /admin/tpex/eod/ingest`. This runs without anyone opening the App. The importer requires one consistent, valid source date matching the expected completed Taiwan session and at least one positive close.
 
+An interrupted official download is retried up to three times per run (30-second timeout per attempt, with one- and two-second delays). Exhausted attempts fail visibly; subsequent scheduled runs continue retrying.
+
 Configure a dedicated random `EOD_INGEST_TOKEN` secret in both Worker and GitHub, and the GitHub variable `QUOTE_WORKER_URL`. The token grants only TPEX ingestion; it is never sent to the official provider. Publish the workflow on the default branch to enable scheduled runs. Polling is Taipei 14:07–22:37 every half hour; a final 23:47 run also checks completeness. Morning retries at 06:17–12:47 recover late publications before the next close. Manual dispatch performs the same final check. GitHub schedules can be delayed or disabled by platform policy; monitor failed runs and schedule activity.
 
 `GET /health/eod` reads dated R2 objects for the calendar's expected completed session. It returns source dates, fetched times, positive-close counts and `complete`, with HTTP 503 when either board is absent. A successful upload of one board is not proof both boards are complete. A stale publication can be retried by polling; the final run fails if the archive is still incomplete. Worker schedules also log incompleteness. No portfolio information is collected.

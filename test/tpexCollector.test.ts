@@ -20,3 +20,15 @@ it('fails the final check when either market archive is absent', async () => {
 	await expect(collectTpex({ workerURL: 'https://archive.invalid', token: 'fixture', requireComplete: true, fetchImpl }))
 		.rejects.toThrow('incomplete');
 });
+
+it('retries a terminated official response body before uploading', async () => {
+	const fetchImpl = vi.fn()
+		.mockResolvedValueOnce({ ok: true, text: async () => { throw new Error('terminated'); } })
+		.mockResolvedValueOnce(Response.json([{ Date: '1150930', Close: '100' }]))
+		.mockResolvedValueOnce(Response.json({ tradingDate: '2026-09-30', quoteCount: 1 }));
+	const wait = vi.fn().mockResolvedValue(undefined);
+	expect(await collectTpex({ workerURL: 'https://archive.invalid', token: 'fixture', fetchImpl, wait }))
+		.toMatchObject({ tradingDate: '2026-09-30' });
+	expect(wait).toHaveBeenCalledWith(1000);
+	expect(fetchImpl.mock.calls[1][1].headers).toBeUndefined();
+});

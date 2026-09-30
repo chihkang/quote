@@ -2,12 +2,23 @@ import { pathToFileURL } from 'node:url';
 
 // Runs on an independent server/runner when the official API rejects Workers' egress.
 // Only public official data is uploaded. The credential is limited to TPEX ingestion.
-export async function collectTpex({ workerURL, token, requireComplete = false, fetchImpl = fetch }) {
+export async function collectTpex({ workerURL, token, requireComplete = false, fetchImpl = fetch,
+	wait = ms => new Promise(resolve => setTimeout(resolve, ms)) }) {
 	if (!workerURL?.startsWith('https://') || !token) throw new Error('Configure QUOTE_WORKER_URL and EOD_INGEST_TOKEN');
-	const source = await fetchImpl('https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes',
-		{ redirect: 'error', signal: AbortSignal.timeout(30000) });
-	if (!source.ok) throw new Error('Official source failed: HTTP ' + source.status);
-	const raw = await source.text();
+	let raw;
+	for (let attempt = 1; attempt <= 3; attempt++) {
+		try {
+			const source = await fetchImpl('https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes',
+				{ redirect: 'error', signal: AbortSignal.timeout(30000) });
+			if (!source.ok) throw new Error('HTTP ' + source.status);
+			// Retry the entire download if the server terminates a partially read body.
+			raw = await source.text();
+			break;
+		} catch (error) {
+			if (attempt === 3) throw new Error('Official source download failed after 3 attempts: ' + error.message);
+			await wait(attempt * 1000);
+		}
+	}
 	if (new TextEncoder().encode(raw).length > 8 * 1024 * 1024) throw new Error('Official payload too large');
 	const rows = JSON.parse(raw);
 	if (!Array.isArray(rows) || !rows.length) throw new Error('Official source returned no rows');
