@@ -351,12 +351,14 @@ Environment variables are defined in [wrangler.jsonc](wrangler.jsonc). Key setti
 ### Scheduled refresh
 
 - `wrangler.jsonc` triggers every ten minutes. Collection runs during Asia/Taipei `06:00-08:59` and `13:40-23:59`, including holidays to retry delayed publication. Calendar coverage is required.
-- Scheduled job fetches both sources and writes separate snapshots:
+- Before downloading, each board checks its dated archive for the calendar's expected completed session. A matching official source with positive finite closes returns `alreadyArchived: true` without downloading or writing; only missing or invalid boards are collected. Holidays and morning retries use the preceding completed session.
+- When collection is needed, the job writes separate snapshots:
 	- `twse/eod/latest.json`
 	- `twse/eod/YYYY-MM-DD.json`
 	- `tpex/eod/latest.json`
 	- `tpex/eod/YYYY-MM-DD.json`
-- Each source is refreshed independently (partial success allowed).
+- Each source is checked and refreshed independently (partial success allowed). The cron still fires after success, but only checks R2 archives and health.
+- Automatic polling stops downloading a board after its first valid archive. This establishes archive availability, not coverage of every security. Use the existing authenticated manual refresh endpoint to collect later fuller publications or official corrections; manual refresh bypasses the archive skip.
 - TPEX refresh attempts OpenAPI first, then the legacy JSON endpoint. Both failing is reported as a partial refresh failure, even when a previous snapshot exists.
 - Identical same-date data is idempotent (`updated: false`). Later same-date publication can fill missing securities or correct values if it preserves the existing symbol coverage; a truncated response cannot replace a fuller archive.
 - Dated snapshots are retained without automatic deletion. `latest.json` points to the newest collected source date. Verify the R2 bucket lifecycle does not separately expire these objects. This accumulates available evidence; it cannot restore dates never collected.

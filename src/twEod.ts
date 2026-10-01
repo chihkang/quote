@@ -17,6 +17,7 @@ export type RefreshResult = {
 	tradingDate: string | null;
 	quoteCount: number;
 	deletedCount: number;
+	alreadyArchived?: boolean;
 };
 
 export type EnvWithTwEod = {
@@ -281,7 +282,7 @@ async function persistSnapshot(
 	const identicalQuotes = latest && incomingKeys.length === Object.keys(latest.quotes).length
 		&& incomingKeys.every(key => JSON.stringify(snapshot.quotes[key]) === JSON.stringify(latest.quotes[key]));
 	if (latest && sameDate && (!preservesCoverage || identicalQuotes)) {
-		if (!await env.TW_EOD_R2.get(getDateKey(board, latest.tradingDate))) {
+		if (!await archivedRefreshResult(env, board, latest.tradingDate)) {
 			await env.TW_EOD_R2.put(getDateKey(board, latest.tradingDate), JSON.stringify(latest),
 				{ httpMetadata: { contentType: 'application/json' } });
 		}
@@ -516,10 +517,36 @@ export function getTwEodQuote(snapshot: TwEodSnapshot | null, ticker: string): T
 	return null;
 }
 
-export async function refreshTwseEodSnapshot(env: EnvWithTwEod, now = new Date()): Promise<RefreshResult> {
+// Scheduled collection skips only a valid dated archive for the expected session.
+// Manual refresh omits the date so later official corrections can still be collected.
+async function archivedRefreshResult(env: EnvWithTwEod, board: Board,
+	tradingDate?: string): Promise<RefreshResult | null> {
+	if (!tradingDate || !env.TW_EOD_R2) return null;
+	let snapshot: TwEodSnapshot | null;
+	try {
+		const object = await env.TW_EOD_R2.get(getDateKey(board, tradingDate));
+		snapshot = object ? parseSnapshot(await object.json()) : null;
+	} catch {
+		// An unreadable archive does not establish success; try collection instead.
+		return null;
+	}
+	if (!snapshot || snapshot.tradingDate !== tradingDate) return null;
+	const validSource = board === 'TWSE' ? snapshot.source === 'TWSE_STOCK_DAY_ALL'
+		: ['TPEX_STK_QUOTE_RESULT', 'TPEX_OPENAPI_MAINBOARD_DAILY_CLOSE_QUOTES'].includes(snapshot.source);
+	const quoteCount = Object.values(snapshot.quotes).filter(quote =>
+		quote && typeof quote.close === 'number' && Number.isFinite(quote.close) && quote.close > 0).length;
+	if (!validSource || quoteCount === 0) return null;
+	return { updated: false, tradingDate, quoteCount, deletedCount: 0, alreadyArchived: true };
+}
+
+export async function refreshTwseEodSnapshot(env: EnvWithTwEod, now = new Date(),
+	archivedTradingDate?: string): Promise<RefreshResult> {
 	if (!env.TW_EOD_R2) {
 		return { updated: false, tradingDate: null, quoteCount: 0, deletedCount: 0 };
 	}
+
+	const archived = await archivedRefreshResult(env, 'TWSE', archivedTradingDate);
+	if (archived) return archived;
 
 	const fetchedAt = now.toISOString();
 	const url = env.TWSE_EOD_URL ?? DEFAULT_TWSE_CSV_URL;
@@ -534,10 +561,14 @@ export async function refreshTwseEodSnapshot(env: EnvWithTwEod, now = new Date()
 	return persistSnapshot(env, 'TWSE', snapshot, now);
 }
 
-export async function refreshTpexEodSnapshot(env: EnvWithTwEod, now = new Date()): Promise<RefreshResult> {
+export async function refreshTpexEodSnapshot(env: EnvWithTwEod, now = new Date(),
+	archivedTradingDate?: string): Promise<RefreshResult> {
 	if (!env.TW_EOD_R2) {
 		return { updated: false, tradingDate: null, quoteCount: 0, deletedCount: 0 };
 	}
+
+	const archived = await archivedRefreshResult(env, 'TPEX', archivedTradingDate);
+	if (archived) return archived;
 
 	const fetchedAt = now.toISOString();
 	const urls = getTpexFetchUrls(env);

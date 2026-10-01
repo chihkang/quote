@@ -975,13 +975,14 @@ export default {
 				scheduledTime: new Date(event.scheduledTime).toISOString(),
 				now: now.toISOString()
 			});
-			if (!shouldRunTwEodRefresh(now) || !resolveMarketCloseContext('TW', now).expectedCloseTradingDate) {
+			const expectedDate = resolveMarketCloseContext('TW', now).expectedCloseTradingDate;
+			if (!shouldRunTwEodRefresh(now) || !expectedDate) {
 				console.log('TWSE/TPEX EOD refresh skipped by local time window', { now: now.toISOString() });
 				return;
 			}
 
 			const [twseResult, tpexResult] = await Promise.all([
-				refreshTwseEodSnapshot(env, now).catch(
+				refreshTwseEodSnapshot(env, now, expectedDate).catch(
 					(error) =>
 						({
 							updated: false,
@@ -991,7 +992,7 @@ export default {
 							error: toRefreshError(error)
 						}) as RefreshResponse
 				),
-				refreshTpexEodSnapshot(env, now).catch(
+				refreshTpexEodSnapshot(env, now, expectedDate).catch(
 					(error) =>
 						({
 							updated: false,
