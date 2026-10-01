@@ -365,19 +365,21 @@ Environment variables are defined in [wrangler.jsonc](wrangler.jsonc). Key setti
 
 Cloudflare egress may be rejected by TPEX. `.github/workflows/archive-tpex.yml` independently downloads the public official OpenAPI on GitHub Actions and uploads the unchanged JSON to `POST /admin/tpex/eod/ingest`. This runs without anyone opening the App. The importer requires one consistent, valid source date matching the expected completed Taiwan session and at least one positive close.
 
-An interrupted official download is retried up to three times per run (30-second timeout per attempt, with one- and two-second delays). Exhausted attempts fail visibly; subsequent scheduled runs continue retrying.
+Before downloading, the collector checks `/health/eod`. If TPEX already has positive prices for the expected completed trading date, it reports `alreadyArchived=true` and skips the download and upload, including when TWSE is still pending (HTTP 503). An unavailable or unverifiable health check does not prevent collection. Final/manual runs always recheck both boards before succeeding.
+
+An interrupted official download is retried up to three times per run (30-second timeout per attempt, with one- and two-second delays). After exhausted attempts, the collector checks the archive again. If a valid expected-date TPEX archive is now available, it reports `alreadyArchived=true` and retains the download failure as `downloadWarning`; final/manual runs still require both boards. Otherwise the download failure remains an error and subsequent scheduled runs continue retrying.
 
 Configure a dedicated random `EOD_INGEST_TOKEN` secret in both Worker and GitHub, and the GitHub variable `QUOTE_WORKER_URL`. The token grants only TPEX ingestion; it is never sent to the official provider. Publish the workflow on the default branch to enable scheduled runs. Polling is Taipei 14:07–22:37 every half hour; a final 23:47 run also checks completeness. Morning retries at 06:17–12:47 recover late publications before the next close. Manual dispatch performs the same final check. GitHub schedules can be delayed or disabled by platform policy; monitor failed runs and schedule activity.
 
 `GET /health/eod` reads dated R2 objects for the calendar's expected completed session. It returns source dates, fetched times, positive-close counts and `complete`, with HTTP 503 when either board is absent. A successful upload of one board is not proof both boards are complete. A stale publication can be retried by polling; the final run fails if the archive is still incomplete. Worker schedules also log incompleteness. No portfolio information is collected.
 
-Here `complete` means both expected-date archives contain positive prices, not that every listed security has a usable close. Consumers must still validate each requested symbol. An upstream download failure can stop the collector before its final health check; a failed run does not by itself mean existing R2 data was lost. Ingestion and health-check failures wait for the next scheduled run; the three short retries apply to the official download only.
+Here `complete` means both expected-date archives contain positive prices, not that every listed security has a usable close. Consumers must still validate each requested symbol. Download failures do not invalidate existing archives. A failed recovery health check cannot establish archive availability, and a failed run does not by itself mean existing R2 data was lost. Ingestion and health-check failures wait for the next scheduled run; the three short retries apply to the official download only.
 
 ```text
 Worker cron -> TWSE official daily data -------------------------+
             -> TPEX OpenAPI -> legacy JSON if request fails -----+
                                                                  |
-GitHub cron -> TPEX OpenAPI (up to 3 download attempts)            |
+GitHub cron -> health precheck -> TPEX OpenAPI if missing         |
                        |                                         |
                        v                                         |
               authenticated Worker ingest -----------------------+
