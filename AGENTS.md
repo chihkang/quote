@@ -13,6 +13,8 @@ This is a TypeScript Cloudflare Worker for batch Taiwan and US stock quotes, wit
 | Task | Reference |
 | --- | --- |
 | API usage, response fields, setup, configuration, or deployment | [README.md](README.md) and scripts in [package.json](package.json) |
+| Current CLI/configuration and build/deploy preview | [cloudflare.config.ts](cloudflare.config.ts), [package.json](package.json), and README.md; retained wrangler.jsonc is a pre-migration reference |
+| Calendar publication and annual releases | [src/marketCalendar.ts](src/marketCalendar.ts), [src/calendarPublication.ts](src/calendarPublication.ts), and test/calendarPublication.test.ts |
 | Close kinds, source/target trading dates, or settlement behavior | [CONTEXT.md](CONTEXT.md), the [completed-session ADR](docs/adr/0002-completed-market-session-context.md), and the [original close-semantics ADR](docs/adr/0001-separate-close-semantics-from-cache-freshness.md) |
 | Request routing, provider calls, or fetch limits | [src/index.ts](src/index.ts) |
 | Symbol handling | [src/symbols.ts](src/symbols.ts) |
@@ -29,6 +31,8 @@ This is a TypeScript Cloudflare Worker for batch Taiwan and US stock quotes, wit
 - Use market-local trading dates (Taipei for TW, New York for US). Apply the ADR's timestamp rules when establishing a provisional quote's source date, keeping `asOf` and `fetchedAt` distinct.
 - US quotes use Finnhub and do not inherit Taiwan R2 EOD fallback or official-close semantics.
 - Use `getTtlSeconds()` for quote TTL decisions. Preserve the shared per-request `MAX_SYNC_FETCH` cap and the US provider concurrency limit of 5 unless changing those policies is part of the request.
+
+- Calendar versions are immutable and append-only. Preserve every release and its ordering; corrections use new identifiers. Select by Taipei effective date, keep both Taipei/New York coverage checks, and never ship synthetic fixtures as official calendars.
 
 ## Local work and verification
 

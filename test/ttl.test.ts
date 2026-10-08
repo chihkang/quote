@@ -40,7 +40,7 @@ describe('getTtlSeconds', () => {
     });
 
     expect(ttl).toEqual({ soft: 180, hard: 3780 });
-    expect(secondsUntilNextTwOpen).toHaveBeenCalledWith(expect.any(Date), '09:00', 180);
+    expect(secondsUntilNextTwOpen).toHaveBeenCalledWith(expect.any(Date), '09:00', 180, undefined);
   });
 
   it('uses offhours ttl for US market', () => {
@@ -55,7 +55,7 @@ describe('getTtlSeconds', () => {
     });
 
     expect(ttl).toEqual({ soft: 1000, hard: 7380 });
-    expect(secondsUntilNextUsOpen).toHaveBeenCalledWith(expect.any(Date), '', 180);
+    expect(secondsUntilNextUsOpen).toHaveBeenCalledWith(expect.any(Date), '', 180, undefined);
   });
 
   it('uses default open buffer when env is missing', () => {
@@ -67,7 +67,7 @@ describe('getTtlSeconds', () => {
     });
 
     expect(ttl).toEqual({ soft: 1000, hard: 2000 });
-    expect(secondsUntilNextUsOpen).toHaveBeenCalledWith(expect.any(Date), '', 300);
+    expect(secondsUntilNextUsOpen).toHaveBeenCalledWith(expect.any(Date), '', 300, undefined);
   });
 
   it('falls back to defaults when env values are missing', () => {

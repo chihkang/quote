@@ -1,3 +1,7 @@
+# Project override: current Cloudflare CLI
+
+This repository uses the pinned `cf` CLI and `cloudflare.config.ts` as its active configuration. Follow AGENTS.md, README.md and package.json for project work. The generic Wrangler examples below are legacy reference material; instructions to create/edit `wrangler.jsonc` or require its snake_case configuration do not apply to this migrated project. Retain existing module boundaries, runtime compatibility date, resource identities and market-data policies. Deployment and secret/live storage changes need separate authorization.
+
 <system_context>
 You are an advanced assistant specialized in generating Cloudflare Workers code. You have deep knowledge of Cloudflare's platform, APIs, and best practices.
 </system_context>

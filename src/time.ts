@@ -1,4 +1,4 @@
-import { isMarketTradingDay, sessionCloseMinutes } from './marketCalendar';
+import { isMarketTradingDay, sessionCloseMinutes, selectMarketCalendar, marketCalendar, type MarketCalendarData } from './marketCalendar';
 export type TimeParts = {
   weekday: number; // 1 = Monday ... 7 = Sunday
   hour: number;
@@ -206,22 +206,26 @@ export function isTradingSessionTWParts(
 export function isTradingSessionTW(
   now = new Date(),
   open = DEFAULT_TW_OPEN,
-  close = DEFAULT_TW_CLOSE
+  close = DEFAULT_TW_CLOSE,
+  data: MarketCalendarData = selectMarketCalendar(now) ?? marketCalendar
 ): boolean {
   const parts = getTaipeiParts(now);
-  return isMarketTradingDay('TW', getTaipeiDateISO(now)) && isTradingSessionTWParts(parts, open, close);
+  const day = getTaipeiDateISO(now);
+  const effectiveClose = close === DEFAULT_TW_CLOSE ? (data.TW.earlyCloses[day] ?? close) : close;
+  return isMarketTradingDay('TW', day, data) && isTradingSessionTWParts(parts, open, effectiveClose);
 }
 
 export function secondsUntilNextTwOpen(
   now = new Date(),
   open = DEFAULT_TW_OPEN,
-  bufferSec = 0
+  bufferSec = 0,
+  data?: MarketCalendarData
 ): number {
   const parts = getDateTimeParts(now, TAIPEI_TIME_ZONE);
   const openParts = parseTimeHHMM(open);
   for (let dayOffset = 0; dayOffset <= 30; dayOffset += 1) {
     const candidate = addDaysToDateParts(parts, dayOffset, TAIPEI_TIME_ZONE);
-    if (!isMarketTradingDay('TW', formatDateIso(candidate))) continue;
+    if (!isMarketTradingDay('TW', formatDateIso(candidate), data)) continue;
     const openAt = zonedDateTimeToUtc(candidate, openParts.hour, openParts.minute, TAIPEI_TIME_ZONE);
     if (openAt <= now) continue;
     return Math.max(0, Math.ceil((openAt.getTime() - now.getTime()) / 1000) + bufferSec);
@@ -231,19 +235,21 @@ export function secondsUntilNextTwOpen(
 
 export function isTradingSessionUS(
   now = new Date(),
-  holidays?: string
+  holidays?: string,
+  data: MarketCalendarData = selectMarketCalendar(now) ?? marketCalendar
 ): boolean {
   const parts = getDateTimeParts(now, NEW_YORK_TIME_ZONE);
   const holidaySet = parseHolidayList(holidays);
-  return isMarketTradingDay('US', formatDateIso(parts)) && isTradingDay(parts, holidaySet)
+  return isMarketTradingDay('US', formatDateIso(parts), data) && isTradingDay(parts, holidaySet)
     && toMinutes(parts) >= US_MARKET_WINDOW.openMinutes
-    && toMinutes(parts) <= sessionCloseMinutes('US', formatDateIso(parts));
+    && toMinutes(parts) <= sessionCloseMinutes('US', formatDateIso(parts), data);
 }
 
 export function secondsUntilNextUsOpen(
   now = new Date(),
   holidays?: string,
-  bufferSec = 0
+  bufferSec = 0,
+  data?: MarketCalendarData
 ): number {
   const currentParts = getDateTimeParts(now, NEW_YORK_TIME_ZONE);
   const openMinutes = US_MARKET_WINDOW.openMinutes;
@@ -262,7 +268,7 @@ export function secondsUntilNextUsOpen(
     }
 
     const openAt = zonedDateTimeToUtc(candidateDate, US_MARKET_OPEN.hour, US_MARKET_OPEN.minute, NEW_YORK_TIME_ZONE);
-    if (!isMarketTradingDay('US', formatDateIso(candidateDate)) || !isTradingDay(getDateTimeParts(openAt, NEW_YORK_TIME_ZONE), holidaySet)) {
+    if (!isMarketTradingDay('US', formatDateIso(candidateDate), data) || !isTradingDay(getDateTimeParts(openAt, NEW_YORK_TIME_ZONE), holidaySet)) {
       continue;
     }
 

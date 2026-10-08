@@ -24,8 +24,8 @@ Cloudflare Worker that serves batch TW and US stock quotes via Fugle (TW) and Fi
 
 ### Prerequisites
 
-- Node.js 18+ (recommended).
-- Cloudflare Wrangler CLI (installed via dev dependencies).
+- Node.js ^22.18.0, ^24.0.0 or >=26.0.0.
+- Cloudflare CLI `cf` 1.0.0-beta.13 and Wrangler 4.148.0 (pinned development dependencies).
 - A Fugle API key (for TW market).
 - A Finnhub API key (for US market).
 
@@ -34,7 +34,7 @@ Cloudflare Worker that serves batch TW and US stock quotes via Fugle (TW) and Fi
 1. Install dependencies.
 
 	 ```bash
-	 npm install
+	 npm ci
 	 ```
 
 2. Create a `.dev.vars` file with your API keys:
@@ -45,7 +45,7 @@ Cloudflare Worker that serves batch TW and US stock quotes via Fugle (TW) and Fi
 	 OFFHOURS_OPEN_BUFFER_SEC=180
 	 ```
 
-3. Update KV/R2 binding IDs and names in [wrangler.jsonc](wrangler.jsonc).
+3. Update KV/R2 binding IDs and names in [cloudflare.config.ts](cloudflare.config.ts).
 
 4. Start the local dev server:
 
@@ -58,9 +58,9 @@ Cloudflare Worker that serves batch TW and US stock quotes via Fugle (TW) and Fi
 For production deployments, you must set API keys as Worker secrets in your Cloudflare environment. Otherwise US quotes will return `FINNHUB_ERROR` and `null` fields.
 
 ```bash
-wrangler secret put FUGLE_API_KEY
-wrangler secret put FINNHUB_API_KEY
-wrangler secret put ADMIN_REFRESH_TOKEN
+npx wrangler secret put FUGLE_API_KEY --name quote-worker
+npx wrangler secret put FINNHUB_API_KEY --name quote-worker
+npx wrangler secret put ADMIN_REFRESH_TOKEN --name quote-worker
 ```
 
 If you deploy to multiple environments, repeat the secret setup per environment.
@@ -307,7 +307,7 @@ sequenceDiagram
 
 ### Configuration
 
-Environment variables are defined in [wrangler.jsonc](wrangler.jsonc). Key settings:
+Environment variables are defined in [cloudflare.config.ts](cloudflare.config.ts). Key settings:
 
 - **L1 (in-memory) TTL**
 	- `L1_TTL_SEC`: Default 20 seconds (applies both during trading and off hours).
@@ -350,7 +350,7 @@ Environment variables are defined in [wrangler.jsonc](wrangler.jsonc). Key setti
 
 ### Scheduled refresh
 
-- `wrangler.jsonc` triggers every ten minutes. Collection runs during Asia/Taipei `06:00-08:59` and `13:40-23:59`, including holidays to retry delayed publication. Calendar coverage is required.
+- `cloudflare.config.ts` triggers every ten minutes. Collection runs during Asia/Taipei `06:00-08:59` and `13:40-23:59`, including holidays to retry delayed publication. Calendar coverage is required.
 - Before downloading, each board checks its dated archive for the calendar's expected completed session. A matching official source with positive finite closes returns `alreadyArchived: true` without downloading or writing; only missing or invalid boards are collected. Holidays and morning retries use the preceding completed session.
 - When collection is needed, the job writes separate snapshots:
 	- `twse/eod/latest.json`
@@ -439,3 +439,25 @@ US quote responses preserve the provider's raw timestamp. `sourceTimestampVerifi
 Taiwan `TW_OPEN` / `TW_CLOSE` must be valid HH:mm values with open before close. Session context, fetch path and TTL use the same window. Non-default windows return a `-session-override` calendar version so clients using the published standard calendar will block settlement instead of treating custom sessions as standard closes.
 
 Legacy US KV entries without this metadata are refreshed once under the existing bounded sync-fetch budget; a known false flag is not repeatedly refetched until normal expiry. Provider errors retain ordinary cache display behavior while settlement remains blocked.
+
+## Downloadable market calendars and current CLI
+
+`GET /market-calendar` publishes schemaVersion 1, revision, and all immutable releases as `{effectiveFrom, sha256, document}`. `document` is the exact UTF-8 JSON string hashed by SHA256. The registry in `src/marketCalendar.ts` is also the source used for quotes, scheduled collection, EOD health, and session/TTL decisions. Only the preserved 2026 calendar is currently released.
+
+Both quote routes accept optional `calendarVersion`. Unknown/uncovered versions return 422 before upstream work; malformed versions return 400. Existing clients may omit the field. Historical lookups select by their valuation reference date. The current catalog needs no authentication and has five-minute public HTTP caching.
+
+Annual publication: validate official TWSE/NYSE evidence, add a new immutable JSON and registry entry with a Taipei `effectiveFrom`, retain every old version, increase `calendarRevision`, run the checks below, then deploy only with explicit deployment authorization. Clients with the download capability need no annual App reinstall. Never ship synthetic test calendars or treat missing official coverage as weekdays.
+
+The project now uses `cf dev`, `cf build`, and `cf deploy`; configuration is `cloudflare.config.ts`. The retained `wrangler.jsonc` is the pre-migration reference for rollback, not the active configuration. Resource identifiers, cron, quote policy variables, and runtime compatibility date are preserved. Local development uses local KV/R2. `cf` is beta and has separate login credentials from Wrangler; do not infer deployment authentication from an existing Wrangler login.
+
+```bash
+npm ci
+npm test
+npm run typecheck
+npm run build
+npm run deploy:dry-run
+```
+
+Build output and generated types under `.cloudflare/` are ignored. `cf build` may print a non-fatal Docker socket probe warning even for this project without Containers; verify exit status and generated Worker output. `npm run deploy:dry-run` uploads nothing. A real `npm run deploy` requires separate authorization. Existing production secrets are managed separately; `cf` beta lacks a single-secret setter, so the explicit-name Wrangler fallback above follows the official reference.
+
+References: [cf beta announcement](https://developers.cloudflare.com/changelog/product/cf/), [migration guide](https://developers.cloudflare.com/cf/wrangler/migrate/), [command and config mapping](https://developers.cloudflare.com/cf/wrangler/reference/).

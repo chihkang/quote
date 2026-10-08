@@ -1,20 +1,29 @@
 {
-	"name": "quote-worker",
-	"version": "0.0.1",
-	"private": true,
-	"type": "module",
-	"scripts": {
-		"dev": "wrangler dev",
-		"deploy": "wrangler deploy",
-		"test": "vitest run",
-		"test:watch": "vitest --watch"
-	},
-	"dependencies": {},
-	"devDependencies": {
-		"@cloudflare/workers-types": "^4.20250129.0",
-		"miniflare": "^4.20260120.0",
-		"typescript": "^5.6.3",
-		"vitest": "^3.2.4",
-		"wrangler": "^4.60.0"
-	}
+  "name": "quote-worker",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "cf dev",
+    "deploy": "cf deploy",
+    "test": "vitest run",
+    "test:watch": "vitest --watch",
+    "build": "cf build",
+    "deploy:dry-run": "cf deploy --dry-run",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20261008.1",
+    "cf": "1.0.0-beta.13",
+    "miniflare": "5.20261006.0-alpha",
+    "typescript": "^5.6.3",
+    "vitest": "5.0.3",
+    "wrangler": "4.148.0"
+  },
+  "engines": {
+    "node": "^22.18.0 || ^24.0.0 || >=26.0.0"
+  },
+  "overrides": {
+    "sharp": "0.35.5"
+  }
 }

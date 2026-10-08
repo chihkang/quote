@@ -1,3 +1,4 @@
+import type { MarketCalendarData } from './marketCalendar';
 import {
   DEFAULT_TW_CLOSE,
   DEFAULT_TW_OPEN,
@@ -39,7 +40,7 @@ function readNonNegativeNumber(value: string | undefined, fallback: number): num
   return parsed;
 }
 
-export function getTtlSeconds(market: 'TW' | 'US', now: Date, env: EnvLike): TTLPair {
+export function getTtlSeconds(market: 'TW' | 'US', now: Date, env: EnvLike, calendar?: MarketCalendarData): TTLPair {
   const twOpen = env.TW_OPEN ?? DEFAULT_TW_OPEN;
   const twClose = env.TW_CLOSE ?? DEFAULT_TW_CLOSE;
   const usHolidays = env.US_HOLIDAYS ?? '';
@@ -48,8 +49,8 @@ export function getTtlSeconds(market: 'TW' | 'US', now: Date, env: EnvLike): TTL
     DEFAULTS.OFFHOURS_OPEN_BUFFER_SEC
   );
 
-  const isTwTrading = market === 'TW' && isTradingSessionTW(now, twOpen, twClose);
-  const isUsTrading = market === 'US' && isTradingSessionUS(now, usHolidays);
+  const isTwTrading = market === 'TW' && isTradingSessionTW(now, twOpen, twClose, calendar);
+  const isUsTrading = market === 'US' && isTradingSessionUS(now, usHolidays, calendar);
 
   if (isTwTrading) {
     return {
@@ -63,7 +64,7 @@ export function getTtlSeconds(market: 'TW' | 'US', now: Date, env: EnvLike): TTL
       env.SOFT_TTL_OFFHOURS_SEC,
       DEFAULTS.SOFT_TTL_OFFHOURS_SEC
     );
-    const hard = secondsUntilNextTwOpen(now, twOpen, openBufferSec);
+    const hard = secondsUntilNextTwOpen(now, twOpen, openBufferSec, calendar);
     return {
       soft,
       hard: Math.max(hard, soft)
@@ -89,7 +90,7 @@ export function getTtlSeconds(market: 'TW' | 'US', now: Date, env: EnvLike): TTL
     env.SOFT_TTL_OFFHOURS_SEC,
     DEFAULTS.SOFT_TTL_OFFHOURS_SEC
   );
-  const offHoursHard = secondsUntilNextUsOpen(now, usHolidays, openBufferSec);
+  const offHoursHard = secondsUntilNextUsOpen(now, usHolidays, openBufferSec, calendar);
   return {
     soft: offHoursSoft,
     hard: Math.max(offHoursHard, offHoursSoft)

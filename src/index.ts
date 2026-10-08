@@ -1,4 +1,5 @@
-import { marketCalendar, resolveMarketCloseContext, isValidTwWindow } from './marketCalendar';
+import { calendarPublication } from './calendarPublication';
+import { marketCalendar, selectMarketCalendar, resolveMarketCloseContext, isValidTwWindow } from './marketCalendar';
 import { l1Get, l1Set } from './l1Cache';
 import { getQuote, putQuote, type QuoteCacheValue } from './kvCache';
 import { classify, isStale } from './quotePolicy';
@@ -539,6 +540,7 @@ export default {
 		}
 
 		const pathname = new URL(request.url).pathname;
+		if (pathname === '/market-calendar' && request.method === 'GET') return calendarPublication();
 		if (pathname === '/health/eod' && request.method === 'GET') return eodHealth(env);
 		if (pathname === '/admin/tpex/eod/ingest') return ingestTpex(request, env);
 		if (pathname === '/admin/twse/eod/refresh') {
@@ -553,7 +555,7 @@ export default {
 		}
 
 		if (pathname === '/quotes/close-by-date') {
-			let body: { valuationDate?: unknown; symbols?: unknown };
+			let body: { valuationDate?: unknown; symbols?: unknown; calendarVersion?: unknown };
 			try { body = await request.json() as typeof body; }
 			catch { return errorResponse('Invalid JSON body', 400); }
 			const valuationDate = body.valuationDate;
@@ -566,7 +568,11 @@ export default {
 				!rawSymbols.every((symbol) => typeof symbol === 'string' && /^[A-Z0-9]{2,8}$/.test(symbol.trim().toUpperCase()))) {
 				return errorResponse('Invalid symbols', 400);
 			}
-			const context = resolveMarketCloseContext('TW', new Date(`${valuationDate}T13:35:00+08:00`));
+			if (body.calendarVersion !== undefined && typeof body.calendarVersion !== 'string') return errorResponse('Invalid calendarVersion', 400);
+			const reference = new Date(`${valuationDate}T13:35:00+08:00`);
+			const archivedCalendar = selectMarketCalendar(reference, body.calendarVersion as string | undefined);
+			if (!archivedCalendar) return errorResponse('Calendar unavailable', 422);
+			const context = resolveMarketCloseContext('TW', reference, archivedCalendar);
 			const expected = context.expectedCloseTradingDate;
 			if (!expected || !context.calendarVersion) return errorResponse('Calendar unavailable', 422);
 			const snapshots = await getArchivedTwEodSnapshots(env, expected);
@@ -594,9 +600,9 @@ export default {
 			return errorResponse('Not Found', 404);
 		}
 
-		let body: { symbols?: unknown; market?: string } = {};
+		let body: { symbols?: unknown; market?: string; calendarVersion?: unknown } = {};
 		try {
-			body = (await request.json()) as { symbols?: unknown; market?: string };
+			body = (await request.json()) as { symbols?: unknown; market?: string; calendarVersion?: unknown };
 		} catch {
 			return errorResponse('Invalid JSON body', 400);
 		}
@@ -628,16 +634,20 @@ export default {
 
 		const now = new Date();
 		const nowMs = now.getTime();
+		if (body.calendarVersion !== undefined && typeof body.calendarVersion !== 'string') return errorResponse('Invalid calendarVersion', 400);
+		const selectedCalendar = selectMarketCalendar(now, body.calendarVersion as string | undefined);
+		if (body.calendarVersion !== undefined && !selectedCalendar) return errorResponse('Calendar unavailable', 422);
+		const baseCalendar = selectedCalendar ?? marketCalendar;
 		const twClose = env.TW_CLOSE ?? '13:30';
 		if (!isValidTwWindow({open: env.TW_OPEN ?? '09:00', close: twClose})) {
 			return errorResponse('Invalid TW trading session window', 400);
 		}
-		const twTrading = isTradingSessionTW(now, env.TW_OPEN ?? '09:00', twClose);
+		const twTrading = isTradingSessionTW(now, env.TW_OPEN ?? '09:00', twClose, baseCalendar);
 		const extraHolidays = (env.US_HOLIDAYS ?? '').split(',').map(day => day.trim())
-			.filter(day => day && !marketCalendar.US.holidays.includes(day));
-		const requestCalendar = extraHolidays.length > 0 ? { ...marketCalendar, calendarVersion: marketCalendar.calendarVersion + '-override', US: { ...marketCalendar.US,
-						holidays: [...marketCalendar.US.holidays, ...extraHolidays]
-		} } : marketCalendar;
+			.filter(day => day && !baseCalendar.US.holidays.includes(day));
+		const requestCalendar = extraHolidays.length > 0 ? { ...baseCalendar, calendarVersion: baseCalendar.calendarVersion + '-override', US: { ...baseCalendar.US,
+						holidays: [...baseCalendar.US.holidays, ...extraHolidays]
+		} } : baseCalendar;
 		const twContext = resolveMarketCloseContext('TW', now, requestCalendar, {open: env.TW_OPEN ?? '09:00', close: twClose});
 		const twPostClose = twContext.marketSessionState === 'post_close';
 		const l1TtlSec = toNumber(env.L1_TTL_SEC, 20);
@@ -773,7 +783,7 @@ export default {
 				continue;
 			}
 
-			const ttl = getTtlSeconds(item.market, now, env);
+			const ttl = getTtlSeconds(item.market, now, env, requestCalendar);
 			const cachedResult = await buildFromCache(
 				nowMs,
 				ttl.soft,
@@ -855,7 +865,7 @@ export default {
 						continue;
 					}
 
-					const ttl = getTtlSeconds(item.market, new Date(fetchedAt), env);
+					const ttl = getTtlSeconds(item.market, new Date(fetchedAt), env, requestCalendar);
 					const cacheValue: QuoteCacheValue = {
 						symbol: item.ticker,
 						canonicalSymbol: item.canonicalSymbol,
@@ -919,7 +929,7 @@ export default {
 								return;
 							}
 
-							const ttl = getTtlSeconds(item.market, new Date(fetchedAt), env);
+							const ttl = getTtlSeconds(item.market, new Date(fetchedAt), env, requestCalendar);
 							const cacheValue: QuoteCacheValue = {
 								symbol: item.ticker,
 								canonicalSymbol: item.canonicalSymbol,
