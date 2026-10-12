@@ -16,9 +16,13 @@ concurrency:
 jobs:
   collect:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 8
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1, Node 24
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0, Node 24
+        with:
+          node-version: '24'
+          package-manager-cache: false
       - name: Collect public official data and verify archive
         env:
           QUOTE_WORKER_URL: ${{ vars.QUOTE_WORKER_URL }}
@@ -30,3 +34,4 @@ jobs:
           else
             node scripts/collect-tpex.mjs
           fi
+

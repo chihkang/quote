@@ -49,14 +49,70 @@ it('retries a terminated official response body before uploading', async () => {
 	expect(fetchImpl.mock.calls[1][1].headers).toBeUndefined();
 });
 
-it('stops after three failed downloads without uploading fabricated data', async () => {
+it('stops after bounded full and range failures without uploading fabricated data', async () => {
 	const fetchImpl = vi.fn().mockRejectedValue(new Error('connection lost'));
 	const wait = vi.fn().mockResolvedValue(undefined);
 	await expect(collectTpex({ workerURL: 'https://archive.invalid', token: 'fixture', fetchImpl: withMissingHealth(fetchImpl), wait }))
 		.rejects.toThrow('failed after 3 attempts');
-	expect(fetchImpl).toHaveBeenCalledTimes(3);
-	expect(wait.mock.calls).toEqual([[1000], [2000]]);
+	expect(fetchImpl).toHaveBeenCalledTimes(5);
+	expect(wait.mock.calls).toEqual([[1000], [2000], [1000]]);
 	expect(fetchImpl.mock.calls.every(call => String(call[0]).startsWith('https://www.tpex.org.tw/'))).toBe(true);
+});
+
+it('retries full official downloads without sending credentials', async () => {
+	let attempts = 0;
+	const fetchImpl = vi.fn(async (url: URL | string, options: any) => {
+		if (String(url).includes('tpex.org.tw')) {
+			expect(options.headers).toBeUndefined();
+			expect(options.redirect).toBe('error');
+			expect(options.signal).toBeInstanceOf(AbortSignal);
+			if (++attempts < 3) throw new TypeError('terminated');
+			return Response.json([{ Date: '1150930', Close: '100' }]);
+		}
+		return Response.json({ tradingDate: '2026-09-30', quoteCount: 1 });
+	});
+	await expect(collectTpex({ workerURL: 'https://archive.invalid', token: 'fixture',
+		fetchImpl: withMissingHealth(fetchImpl), wait: async () => {} })).resolves.toMatchObject({ quoteCount: 1 });
+	expect(attempts).toBe(3);
+});
+
+it('retries a syntactically truncated HTTP 200 body and uploads only the complete official JSON', async () => {
+	const body = JSON.stringify([{ Date: '1150930', Close: '100' }]);
+	const fetchImpl = vi.fn().mockResolvedValueOnce(new Response('[{"Date":"1150930"'))
+		.mockResolvedValueOnce(new Response(body))
+		.mockResolvedValueOnce(Response.json({ tradingDate: '2026-09-30', quoteCount: 1 }));
+	const wait = vi.fn().mockResolvedValue(undefined);
+	await expect(collectTpex({ workerURL: 'https://archive.invalid', token: 'fixture',
+		fetchImpl: withMissingHealth(fetchImpl), wait })).resolves.toMatchObject({ quoteCount: 1 });
+	expect(wait.mock.calls).toEqual([[1000]]);
+	expect(fetchImpl.mock.calls[2][1].body).toBe(body);
+});
+
+it.each(['[', '[]', '{}', '<html>temporarily unavailable</html>'])
+('never uploads an invalid official response after exhausting retries: %s', async body => {
+	const fetchImpl = vi.fn(async (_url: URL | string) => new Response(body));
+	await expect(collectTpex({ workerURL: 'https://archive.invalid', token: 'fixture',
+		fetchImpl: withMissingHealth(fetchImpl), wait: async () => {} })).rejects.toThrow('failed after 3 attempts');
+	expect(fetchImpl).toHaveBeenCalledTimes(5);
+	expect(fetchImpl.mock.calls.every(call => String(call[0]).includes('tpex.org.tw/'))).toBe(true);
+});
+
+it('rejects oversized UTF-8 payloads by byte count before upload', async () => {
+	// This is below the limit in UTF-16 code units but exceeds eight MiB in UTF-8.
+	const body = JSON.stringify(['櫃'.repeat(3 * 1024 * 1024)]);
+	const fetchImpl = vi.fn(async (_url: URL | string) => new Response(body));
+	await expect(collectTpex({ workerURL: 'https://archive.invalid', token: 'fixture',
+		fetchImpl: withMissingHealth(fetchImpl), wait: async () => {} })).rejects.toThrow('Official payload too large');
+	expect(fetchImpl.mock.calls.every(call => String(call[0]).includes('tpex.org.tw/'))).toBe(true);
+});
+
+it('retains nested transport failure diagnostics without exposing the full socket object', async () => {
+	const cause = Object.assign(new Error('other side closed'), { code: 'UND_ERR_SOCKET', socket: { privateDetail: 'do not log' } });
+	const fetchImpl = vi.fn().mockRejectedValue(new TypeError('terminated', { cause }));
+	const promise = collectTpex({ workerURL: 'https://archive.invalid', token: 'fixture',
+		fetchImpl: withMissingHealth(fetchImpl), wait: async () => {} });
+	await expect(promise).rejects.toThrow('terminated: other side closed [UND_ERR_SOCKET]');
+	await expect(promise).rejects.not.toThrow('do not log');
 });
 
 it('treats delayed publication as pending during polling but fails the final missing-archive check', async () => {
@@ -135,6 +191,18 @@ it.each([false, true])('keeps the final TWSE requirement after download recovery
 	else expect(await result).toMatchObject({ alreadyArchived: true, downloadWarning: expect.stringContaining('terminated') });
 });
 
+it.each([false, true])('rechecks verified archive health after both full and range recovery fail (final=%s)', async requireComplete => {
+	let checks = 0;
+	const fetchImpl = vi.fn(async (url: URL | string) => {
+		if (String(url).endsWith('/health/eod')) return healthResponse(++checks >= 3, true);
+		expect(String(url)).toContain('tpex.org.tw/');
+		throw new Error('terminated');
+	});
+	await expect(collectTpex({ workerURL: 'https://archive.invalid', token: 'fixture', requireComplete,
+		fetchImpl, wait: async () => {} })).resolves.toMatchObject({ alreadyArchived: true,
+		downloadWarning: expect.stringContaining('range recovery failed') });
+});
+
 it.each(['stale date', 'zero prices', 'missing date', 'unavailable', 'invalid JSON', 'HTTP 401', 'network error'])
 ('does not trust an unverifiable archive: %s', async scenario => {
 	const fetchImpl = vi.fn(async (url: URL | string) => {
@@ -205,3 +273,4 @@ it.each(['stale TWSE date', 'zero TWSE prices', 'health unavailable'])
 	await expect(collectTpex({ workerURL: 'https://archive.invalid', token: 'fixture', requireComplete: true, fetchImpl }))
 		.rejects.toThrow('incomplete');
 });
+

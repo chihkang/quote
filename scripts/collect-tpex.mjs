@@ -1,4 +1,22 @@
 import { pathToFileURL } from 'node:url';
+import { downloadTpexRanges, TPEX_URL } from './tpex-download.mjs';
+
+function validateOfficialPayload(raw) {
+	if (new TextEncoder().encode(raw).length > 8 * 1024 * 1024) throw new Error('Official payload too large');
+	const rows = JSON.parse(raw);
+	if (!Array.isArray(rows) || !rows.length) throw new Error('Official source returned no rows');
+	return raw;
+}
+
+function describeDownloadError(error) {
+	const messages = [];
+	for (let current = error; current && messages.length < 3; current = current.cause) {
+		const message = String(current.message ?? current).slice(0, 250);
+		const code = typeof current.code === 'string' ? ` [${current.code.slice(0, 80)}]` : '';
+		messages.push(message + code);
+	}
+	return messages.join(': ');
+}
 
 async function readArchiveHealth(workerURL, fetchImpl) {
 	try {
@@ -46,27 +64,35 @@ export async function collectTpex({ workerURL, token, requireComplete = false, f
 	const initialHealth = await readArchiveHealth(workerURL, fetchImpl);
 	if (hasArchivedBoard(initialHealth, 'TPEX')) return archivedResult(initialHealth);
 	let raw;
+	let downloadMethod = 'full';
 	for (let attempt = 1; attempt <= 3; attempt++) {
 		try {
-			const source = await fetchImpl('https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes',
+			const source = await fetchImpl(TPEX_URL,
 				{ redirect: 'error', signal: AbortSignal.timeout(30000) });
 			if (!source.ok) throw new Error('HTTP ' + source.status);
-			// Retry the entire download if the server terminates a partially read body.
-			raw = await source.text();
+			// Retry interrupted bodies and HTTP 200 responses containing truncated JSON.
+			// Never retain a partial or invalid body for ingestion.
+			raw = validateOfficialPayload(await source.text());
 			break;
 		} catch (error) {
 			if (attempt === 3) {
-				const warning = 'Official source download failed after 3 attempts: ' + error.message;
+				const warning = 'Official source download failed after 3 attempts: ' + describeDownloadError(error);
 				const recoveredHealth = await readArchiveHealth(workerURL, fetchImpl);
 				if (hasArchivedBoard(recoveredHealth, 'TPEX')) return archivedResult(recoveredHealth, warning);
-				throw new Error(warning);
+				try {
+					raw = validateOfficialPayload(await downloadTpexRanges({ fetchImpl, wait }));
+					downloadMethod = 'byte-ranges';
+					break;
+				} catch (rangeError) {
+					const combinedWarning = warning + '; range recovery failed: ' + describeDownloadError(rangeError);
+					const finalHealth = await readArchiveHealth(workerURL, fetchImpl);
+					if (hasArchivedBoard(finalHealth, 'TPEX')) return archivedResult(finalHealth, combinedWarning);
+					throw new Error(combinedWarning);
+				}
 			}
 			await wait(attempt * 1000);
 		}
 	}
-	if (new TextEncoder().encode(raw).length > 8 * 1024 * 1024) throw new Error('Official payload too large');
-	const rows = JSON.parse(raw);
-	if (!Array.isArray(rows) || !rows.length) throw new Error('Official source returned no rows');
 	const ingest = await fetchImpl(new URL('/admin/tpex/eod/ingest', workerURL), {
 		method: 'POST', redirect: 'error', signal: AbortSignal.timeout(30000),
 		headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token }, body: raw
@@ -77,7 +103,7 @@ export async function collectTpex({ workerURL, token, requireComplete = false, f
 	if (requireComplete) {
 		requireCompleteArchive(await readArchiveHealth(workerURL, fetchImpl));
 	}
-	return { awaitingPublication, tradingDate: result.tradingDate ?? null, quoteCount: result.quoteCount ?? 0 };
+	return { awaitingPublication, tradingDate: result.tradingDate ?? null, quoteCount: result.quoteCount ?? 0, downloadMethod };
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
@@ -89,3 +115,4 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
 		})
 		.catch(error => { console.error(error.message); process.exitCode = 1; });
 }
+
