@@ -2,7 +2,7 @@ import { calendarPublication } from './calendarPublication';
 import { marketCalendar, selectMarketCalendar, resolveMarketCloseContext, isValidTwWindow } from './marketCalendar';
 import { l1Get, l1Set } from './l1Cache';
 import { getQuote, putQuote, type QuoteCacheValue } from './kvCache';
-import { classify, isStale } from './quotePolicy';
+import { assessUSSource, classify, isStale } from './quotePolicy';
 import { normalizeSymbols, type NormalizedSymbol } from './symbols';
 import {
 	getNewYorkDateISO,
@@ -62,6 +62,7 @@ type QuoteResult = {
 	currency: string | null;
 	asOf: string | null;
 	sourceTimestampVerified?: boolean;
+	cacheOrigin?: 'provider' | 'kv' | 'l1';
 	fetchedAt: string | null;
 	ttlHardSec: number | null;
 	expiresAt: string | null;
@@ -271,7 +272,11 @@ async function fetchFinnhubQuote(symbol: string, env: Env) {
 		throw new HttpStatusError(`Finnhub API error: ${response.status}`, response.status);
 	}
 
-	const data = await response.json();
+	const data: any = await response.json();
+	// Only public numeric quote fields are logged; never URLs, keys or bodies.
+	console.info('Finnhub quote response', {symbol, httpStatus: response.status,
+		c: typeof data?.c === 'number' && Number.isFinite(data.c) ? data.c : null,
+		t: typeof data?.t === 'number' && Number.isFinite(data.t) ? data.t : null});
 	return mapFinnhubQuote(data);
 }
 
@@ -292,6 +297,7 @@ async function buildFromCache(
 		symbol: normalized.originalSymbol,
 		canonicalSymbol: normalized.canonicalSymbol,
 		market: normalized.market,
+		cacheOrigin: 'kv',
 		price: cached.price,
 		currency: cached.currency,
 		asOf: cached.asOf,
@@ -405,6 +411,7 @@ function buildFreshQuoteResult(
 		symbol: normalized.originalSymbol,
 		canonicalSymbol: normalized.canonicalSymbol,
 		market: normalized.market,
+		cacheOrigin: 'provider',
 		price: cacheValue.price,
 		currency: cacheValue.currency,
 		asOf: cacheValue.asOf,
@@ -766,7 +773,7 @@ export default {
 
 			const l1Hit = l1Get<QuoteResult>(item.kvKey, nowMs);
 			if (l1Hit && !(item.market === 'US' && l1Hit.sourceTimestampVerified === undefined)) {
-				results[i] = l1Hit;
+				results[i] = {...l1Hit, cacheOrigin: 'l1'};
 				continue;
 			}
 
@@ -920,7 +927,7 @@ export default {
 							const fetchedAt = new Date().toISOString();
 							const { price, currency, asOf } = await fetchFinnhubQuote(item.ticker, env);
 
-							if (price === null) {
+							if (price === null || price <= 0) {
 								console.warn('Finnhub quote missing price', { symbol: item.ticker });
 								results[index] = {
 									...results[index],
@@ -929,6 +936,11 @@ export default {
 								return;
 							}
 
+							const sourceState = assessUSSource(new Date(fetchedAt), asOf, requestCalendar);
+							// A successful HTTP request must not replace a newer verified source.
+							const previous = results[index];
+							if (previous.sourceTimestampVerified === true && previous.asOf &&
+								(sourceState.sourceStatus === 'invalid' || !asOf || Date.parse(previous.asOf) > Date.parse(asOf))) return;
 							const ttl = getTtlSeconds(item.market, new Date(fetchedAt), env, requestCalendar);
 							const cacheValue: QuoteCacheValue = {
 								symbol: item.ticker,
@@ -957,7 +969,7 @@ export default {
 							l1Set(item.kvKey, freshResult, l1TtlSec);
 							results[index] = freshResult;
 						} catch (error) {
-							console.error('Finnhub quote failed', { symbol: item.ticker, error });
+							console.error('Finnhub quote failed', { symbol: item.ticker, httpStatus: error instanceof HttpStatusError ? error.status : null });
 							results[index] = {
 								...results[index],
 								reason: 'FINNHUB_ERROR'
@@ -971,6 +983,9 @@ export default {
 		return jsonResponse({
 			serverTime: now.toISOString(),
 			results: results.map(result => ({ ...result,
+				// Re-evaluate source time for L1/KV hits without changing cache status.
+				...(result.market === 'US' ? assessUSSource(now, result.asOf, requestCalendar,
+					result.sourceTimestampVerified === true) : {}),
 				targetTradingDate: getMarketDateISO(result.market, now),
 				...resolveMarketCloseContext(result.market, now, requestCalendar, {open: env.TW_OPEN ?? '09:00', close: twClose})
 			}))

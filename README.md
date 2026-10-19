@@ -141,6 +141,14 @@ Response:
 - `marketSessionState`: `pre_open`, `open`, `post_close`, or `closed` at request time.
 - `calendarVersion`: Calendar rules used for the context, or `null` outside coverage. Settlement clients must use matching rules and versions.
 - `sourceTimestampVerified`: Whether a US source timestamp came from the provider. Legacy or missing provider time is false; `fetchedAt` never fills missing US `asOf`. This flag alone does not prove a completed close.
+- `sourceStatus` (US): `current`, `recent_close`, `delayed`, `expired`, `invalid`, or `unavailable`. This is independent of cache `status`/`isStale`; a newly fetched old quote can be cache-fresh with an expired source.
+- `sourceReason` and `sourceAgeSec` (US): the source classification reason and seconds since raw `asOf` (`null` when missing). Future source times can have a negative age and are invalid beyond 60 seconds of clock tolerance.
+- `cacheOrigin`: `provider`, `kv`, or `l1` for ordinary quote results, identifying the path used for this response, not the authority of the price.
+
+US source policy uses the published New York calendar, holidays, early closes and DST. During regular hours, a print from the current session within five minutes is current; an older print from that session is delayed, and a prior-session print is expired. Off-hours, a print within five minutes of the expected completed session close is `recent_close`; it remains provider data, never official EOD. Unknown calendar coverage and invalid/unverified source times cannot establish source freshness. Legacy clients still receive the original cache status, reason and price behavior; clients must inspect source fields (or independently validate `asOf`) before calling a quote current.
+
+Provider-fetch diagnostics log only the symbol, HTTP status, and numeric raw Finnhub `c`/`t`. HTTP errors log the status without response bodies, URLs, keys or tokens. Source classification and `cacheOrigin` can distinguish a provider response from a cached/fallback price after a separately authorized deployment. These fields alone do not prove why a provider returned an old timestamp.
+
 
 For example, a Taiwan official close on the 2026/9/28 holiday has `targetTradingDate=2026-09-28`, `expectedCloseTradingDate=2026-09-24`, `sourceTradingDate=2026-09-24`, and `marketSessionState=closed`. Preserve the real source date; do not relabel it as a 9/28 close. See [settlement calendar context](#settlement-calendar-context) for coverage and US provenance rules.
 

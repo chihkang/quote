@@ -26,3 +26,7 @@ describe('classify', () => {
     expect(classify(now, fetchedAt, 300, 3600, 100)).toBe('fresh');
   });
 });
+
+it('soft TTL jitter cannot extend the hard expiry', () => {
+  expect(classify(360_000, 0, 300, 300, 300)).toBe('missing');
+});
