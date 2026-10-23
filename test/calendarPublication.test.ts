@@ -1,7 +1,7 @@
 import { getTtlSeconds } from '../src/ttl';
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import worker from '../src/index';
-import { marketCalendar, resolveMarketCloseContext, selectMarketCalendar, type CalendarRelease } from '../src/marketCalendar';
+import { calendarRevision, releasedCalendars, marketCalendar, resolveMarketCloseContext, selectMarketCalendar, type CalendarRelease } from '../src/marketCalendar';
 
 const next = { ...marketCalendar, calendarVersion: 'fixture-2027', coverageStart: '2026-12-01', coverageEnd: '2027-12-31',
   TW: { holidays: ['2027-01-01'], earlyCloses: {} }, US: { holidays: ['2027-01-01'], earlyCloses: {'2027-11-26': '13:00'} } };
@@ -52,5 +52,45 @@ describe('pinned market-session timing', () => {
     const amended = {...marketCalendar, TW:{...marketCalendar.TW,earlyCloses:{'2026-09-29':'12:00'}}};
     expect(resolveMarketCloseContext('TW',new Date('2026-09-29T04:01:00Z'),amended).marketSessionState).toBe('post_close');
     expect(getTtlSeconds('TW',new Date('2026-09-29T04:01:00Z'),{SOFT_TTL_TRADING_SEC:'300',SOFT_TTL_OFFHOURS_SEC:'1000'},amended).soft).toBe(1000);
+  });
+});
+
+
+describe('append-only October closure publication', () => {
+  it('retains the published v1 digest and appends a separately hashed v2', async () => {
+    const response = await worker.fetch(new Request('https://quote.test/market-calendar'), {} as never);
+    const body = await response.json() as {revision: number; calendars: {effectiveFrom: string; sha256: string; document: string}[]};
+    expect(body.revision).toBe(202602);
+    expect(body.revision).toBe(calendarRevision);
+    expect(body.calendars).toHaveLength(2);
+    expect(body.calendars[0].effectiveFrom).toBe('2025-12-01');
+    // Frozen digest of the original published JSON document, not recomputed from a mutable fixture.
+    expect(body.calendars[0].sha256).toBe('3c406eaf4f5eed72886e83add2e72a5a1ac23f5501dedf18485eb1f90f56aaab');
+    const correction = body.calendars[1];
+    expect(correction.effectiveFrom).toBe('2026-10-23');
+    expect(JSON.parse(correction.document)).toEqual(releasedCalendars[1].data);
+    const bytes = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(correction.document));
+    expect(correction.sha256).toBe(Array.from(new Uint8Array(bytes), b => b.toString(16).padStart(2, '0')).join(''));
+    const v2 = JSON.parse(correction.document);
+    expect(v2.calendarVersion).toBe('twse-nyse-2026-v2');
+    expect(v2.TW.holidays).toEqual([...marketCalendar.TW.holidays, '2026-10-23'].sort());
+    expect(v2.TW.earlyCloses).toEqual(marketCalendar.TW.earlyCloses);
+    expect(v2.US).toEqual(marketCalendar.US);
+    expect([v2.coverageStart, v2.coverageEnd]).toEqual([marketCalendar.coverageStart, marketCalendar.coverageEnd]);
+  });
+  it('activates only at Taipei midnight and preserves explicit historical versions', () => {
+    const before = new Date('2026-10-22T15:59:59Z');
+    const after = new Date('2026-10-22T16:00:00Z');
+    expect(selectMarketCalendar(before)).toBe(marketCalendar);
+    expect(selectMarketCalendar(before, 'twse-nyse-2026-v2')).toBeUndefined();
+    expect(selectMarketCalendar(after)?.calendarVersion).toBe('twse-nyse-2026-v2');
+    expect(selectMarketCalendar(after, marketCalendar.calendarVersion)).toBe(marketCalendar);
+    const historical = new Date('2026-10-22T06:00:00Z');
+    expect(resolveMarketCloseContext('TW', historical)).toEqual({
+      expectedCloseTradingDate: '2026-10-22', marketSessionState: 'post_close',
+      calendarVersion: 'twse-nyse-2026-v1'
+    });
+    expect(resolveMarketCloseContext('TW', new Date('2026-10-23T06:00:00Z'), marketCalendar))
+      .toMatchObject({expectedCloseTradingDate: '2026-10-23', calendarVersion: 'twse-nyse-2026-v1'});
   });
 });

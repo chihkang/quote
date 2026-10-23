@@ -1,4 +1,5 @@
 import calendarData from './data/market-calendar-2026.json';
+import correctedCalendarData from './data/market-calendar-2026-v2.json';
 
 export type Market = 'TW' | 'US';
 export type MarketSessionState = 'pre_open' | 'open' | 'post_close' | 'closed';
@@ -17,9 +18,10 @@ export type MarketCalendarData = {
 export const marketCalendar: MarketCalendarData = calendarData;
 export type CalendarRelease = { effectiveFrom: string; data: MarketCalendarData };
 // Append verified versions here; never change an already published identifier.
-export const calendarRevision = 202601;
+export const calendarRevision = 202602;
 export const releasedCalendars: readonly CalendarRelease[] = [
-  { effectiveFrom: '2025-12-01', data: marketCalendar }
+  { effectiveFrom: '2025-12-01', data: marketCalendar },
+  { effectiveFrom: '2026-10-23', data: correctedCalendarData }
 ];
 export function selectMarketCalendar(at: Date, version?: string,
   releases: readonly CalendarRelease[] = releasedCalendars): MarketCalendarData | undefined {

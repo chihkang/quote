@@ -36,3 +36,33 @@ describe('completed market session context', () => {
       .expectedCloseTradingDate).toBe('2026-09-24');
   });
 });
+
+
+describe('October emergency closure', () => {
+  it.each(['2026-10-23', '2026-10-24', '2026-10-25', '2026-10-26'])(
+    'keeps the completed session at October 22 on %s', day => {
+      for (const time of ['08:00', '10:00', '14:00']) {
+        const now = new Date(`${day}T${time}:00+08:00`);
+        expect(resolveMarketCloseContext('TW', now)).toEqual({
+          expectedCloseTradingDate: '2026-10-22', marketSessionState: 'closed',
+          calendarVersion: 'twse-nyse-2026-v2'
+        });
+        expect(isTradingSessionTW(now)).toBe(false);
+      }
+    });
+  it.each([
+    ['08:59', '2026-10-22', 'pre_open'],
+    ['09:00', '2026-10-22', 'open'],
+    ['13:30', '2026-10-22', 'open'],
+    ['13:31', '2026-10-27', 'post_close']
+  ])('resumes the October 27 session at %s', (time, expected, state) => {
+    expect(resolveMarketCloseContext('TW', new Date(`2026-10-27T${time}:00+08:00`)))
+      .toMatchObject({expectedCloseTradingDate: expected, marketSessionState: state,
+        calendarVersion: 'twse-nyse-2026-v2'});
+  });
+  it('skips the closure and existing October 26 holiday when finding the next open', () => {
+    const now = new Date('2026-10-23T10:00:00+08:00');
+    expect(secondsUntilNextTwOpen(now)).toBe(
+      (Date.parse('2026-10-27T09:00:00+08:00') - now.getTime()) / 1000);
+  });
+});

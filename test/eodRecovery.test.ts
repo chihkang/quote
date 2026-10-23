@@ -80,3 +80,31 @@ it('blocks import and health confirmation outside calendar coverage', async () =
 	expect(health.status).toBe(503);
 	expect(await health.json()).toMatchObject({ complete: false, expectedTradingDate: null });
 });
+
+
+it.each(['2026-10-23', '2026-10-24', '2026-10-25', '2026-10-26'])(
+  'reports both October 22 archives ready throughout the closure on %s', async day => {
+    vi.useFakeTimers(); vi.setSystemTime(new Date(`${day}T06:00:00Z`));
+    const { env, objects } = setup();
+    for (const [board, source, symbol] of [
+      ['twse', 'TWSE_STOCK_DAY_ALL', '2330'],
+      ['tpex', 'TPEX_OPENAPI_MAINBOARD_DAILY_CLOSE_QUOTES', '6488']
+    ]) {
+      objects.set(`${board}/eod/2026-10-22.json`, JSON.stringify({
+        tradingDate: '2026-10-22', fetchedAt: '2026-10-22T08:00:00Z', source,
+        quotes: { [symbol]: { close: 100, name: symbol } }
+      }));
+    }
+    const response = await worker.fetch(new Request('https://fixture.invalid/health/eod'), env);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ complete: true, expectedTradingDate: '2026-10-22',
+      calendarVersion: 'twse-nyse-2026-v2', boards: {
+        TWSE: { available: true, sourceTradingDate: '2026-10-22' },
+        TPEX: { available: true, sourceTradingDate: '2026-10-22' }
+      } });
+    vi.setSystemTime(new Date('2026-10-27T06:00:00Z'));
+    const reopened = await worker.fetch(new Request('https://fixture.invalid/health/eod'), env);
+    expect(reopened.status).toBe(503);
+    expect(await reopened.json()).toMatchObject({complete: false, expectedTradingDate: '2026-10-27',
+      boards: {TWSE: {available: false}, TPEX: {available: false}}});
+  });
