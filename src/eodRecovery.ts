@@ -1,14 +1,18 @@
-import { resolveMarketCloseContext } from './marketCalendar';
+import { resolveMarketCloseContext, selectMarketCalendar, releasedCalendars, calendarRevision, type CalendarRelease } from './marketCalendar';
 import { getArchivedTwEodSnapshots, ingestTpexEodSnapshot, type EnvWithTwEod } from './twEod';
 
 type Env = EnvWithTwEod & { EOD_INGEST_TOKEN?: string };
 const json = (value: unknown, status = 200) => Response.json(value, { status,
 	headers: { 'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*' } });
 
-export async function eodHealth(env: Env, now = new Date()): Promise<Response> {
-	const context = resolveMarketCloseContext('TW', now);
+export async function eodHealth(env: Env, now = new Date(), releases: readonly CalendarRelease[] = releasedCalendars, revision = calendarRevision): Promise<Response> {
+	const selected = selectMarketCalendar(now, undefined, releases);
+	const context = selected ? resolveMarketCloseContext('TW', now, selected)
+		: {expectedCloseTradingDate:null,marketSessionState:'closed',calendarVersion:null};
 	const expectedTradingDate = context.expectedCloseTradingDate;
-	const snapshots = expectedTradingDate ? await getArchivedTwEodSnapshots(env, expectedTradingDate) : [];
+	let snapshots: Awaited<ReturnType<typeof getArchivedTwEodSnapshots>>;
+	try {snapshots = expectedTradingDate ? await getArchivedTwEodSnapshots(env, expectedTradingDate) : [];}
+	catch {return json({complete:false,expectedTradingDate,calendarVersion:context.calendarVersion,calendarRevision:revision,archiveStatus:'source_error'},503);}
 	const boards = Object.fromEntries(['TWSE', 'TPEX'].map(board => {
 		const snapshot = snapshots.find(item => item.source.startsWith(board + '_'));
 		const quoteCount = snapshot ? Object.values(snapshot.quotes).filter(q => q.close !== null && q.close > 0).length : 0;
@@ -16,10 +20,12 @@ export async function eodHealth(env: Env, now = new Date()): Promise<Response> {
 			fetchedAt: snapshot?.fetchedAt ?? null, quoteCount }];
 	}));
 	const complete = !!expectedTradingDate && boards.TWSE.available && boards.TPEX.available;
-	return json({ complete, expectedTradingDate, calendarVersion: context.calendarVersion, boards }, complete ? 200 : 503);
+	return json({ complete, expectedTradingDate, calendarVersion: context.calendarVersion, calendarRevision: revision,
+		marketStatus: context.marketSessionState === 'closed' && context.calendarVersion ? 'confirmed_closed' : context.marketSessionState,
+		archiveStatus: !expectedTradingDate ? 'calendar_unavailable' : complete ? 'complete' : 'awaiting_publication', boards }, complete ? 200 : 503);
 }
 
-export async function ingestTpex(request: Request, env: Env, now = new Date()): Promise<Response> {
+export async function ingestTpex(request: Request, env: Env, now = new Date(), releases: readonly CalendarRelease[] = releasedCalendars): Promise<Response> {
 	if (request.method !== 'POST') return json({ error: 'Method Not Allowed' }, 405);
 	if (!env.EOD_INGEST_TOKEN) return json({ error: 'Ingestion not configured' }, 503);
 	if (request.headers.get('authorization') !== 'Bearer ' + env.EOD_INGEST_TOKEN) return json({ error: 'Unauthorized' }, 401);
@@ -42,7 +48,8 @@ export async function ingestTpex(request: Request, env: Env, now = new Date()): 
 	let payload: unknown;
 	try { payload = JSON.parse(new TextDecoder().decode(bytes)); }
 	catch { return json({ error: 'Invalid JSON' }, 400); }
-	const expected = resolveMarketCloseContext('TW', now).expectedCloseTradingDate;
+	const selected = selectMarketCalendar(now, undefined, releases);
+	const expected = selected ? resolveMarketCloseContext('TW', now, selected).expectedCloseTradingDate : null;
 	if (!expected) return json({ error: 'Calendar unavailable' }, 503);
 	try {
 		const result = await ingestTpexEodSnapshot(env, payload, expected, now);

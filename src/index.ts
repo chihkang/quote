@@ -1,5 +1,6 @@
 import { calendarPublication } from './calendarPublication';
-import { marketCalendar, selectMarketCalendar, resolveMarketCloseContext, isValidTwWindow } from './marketCalendar';
+import { loadCalendarCatalog, publishCalendar, publishManualClosure, calendarBootstrap, calendarSourceError } from './calendarCatalog';
+import { selectMarketCalendar, resolveMarketCloseContext, isValidTwWindow } from './marketCalendar';
 import { l1Get, l1Set } from './l1Cache';
 import { getQuote, putQuote, type QuoteCacheValue } from './kvCache';
 import { assessUSSource, classify, isStale } from './quotePolicy';
@@ -31,6 +32,8 @@ export type Env = {
 	FINNHUB_API_KEY: string;
 	TW_EOD_R2?: R2Bucket;
 	ADMIN_REFRESH_TOKEN?: string;
+	CALENDAR_STORAGE_REQUIRED?: string;
+	CALENDAR_GITHUB_AUDIENCE?: string;
 	DEFAULT_MARKET?: string;
 	MAX_SYNC_FETCH?: string;
 	MAX_SYMBOLS_PER_REQUEST?: string;
@@ -547,9 +550,15 @@ export default {
 		}
 
 		const pathname = new URL(request.url).pathname;
-		if (pathname === '/market-calendar' && request.method === 'GET') return calendarPublication();
-		if (pathname === '/health/eod' && request.method === 'GET') return eodHealth(env);
-		if (pathname === '/admin/tpex/eod/ingest') return ingestTpex(request, env);
+		if (pathname === '/admin/market-calendar/publish') return publishCalendar(request, env);
+		if (pathname === '/admin/market-calendar/closures') return publishManualClosure(request, env);
+		if (pathname === '/market-calendar/bootstrap' && request.method === 'GET') return calendarBootstrap(env);
+		let calendars: Awaited<ReturnType<typeof loadCalendarCatalog>>;
+		try { calendars = await loadCalendarCatalog(env); }
+		catch { return calendarSourceError(); }
+		if (pathname === '/market-calendar' && request.method === 'GET') return calendarPublication(calendars.catalog);
+		if (pathname === '/health/eod' && request.method === 'GET') return eodHealth(env, new Date(), calendars.releases, calendars.catalog.revision);
+		if (pathname === '/admin/tpex/eod/ingest') return ingestTpex(request, env, new Date(), calendars.releases);
 		if (pathname === '/admin/twse/eod/refresh') {
 			if (request.method !== 'POST') {
 				return errorResponse('Method Not Allowed', 405);
@@ -577,7 +586,7 @@ export default {
 			}
 			if (body.calendarVersion !== undefined && typeof body.calendarVersion !== 'string') return errorResponse('Invalid calendarVersion', 400);
 			const reference = new Date(`${valuationDate}T13:35:00+08:00`);
-			const archivedCalendar = selectMarketCalendar(reference, body.calendarVersion as string | undefined);
+			const archivedCalendar = selectMarketCalendar(reference, body.calendarVersion as string | undefined, calendars.releases);
 			if (!archivedCalendar) return errorResponse('Calendar unavailable', 422);
 			const context = resolveMarketCloseContext('TW', reference, archivedCalendar);
 			const expected = context.expectedCloseTradingDate;
@@ -642,9 +651,9 @@ export default {
 		const now = new Date();
 		const nowMs = now.getTime();
 		if (body.calendarVersion !== undefined && typeof body.calendarVersion !== 'string') return errorResponse('Invalid calendarVersion', 400);
-		const selectedCalendar = selectMarketCalendar(now, body.calendarVersion as string | undefined);
-		if (body.calendarVersion !== undefined && !selectedCalendar) return errorResponse('Calendar unavailable', 422);
-		const baseCalendar = selectedCalendar ?? marketCalendar;
+		const selectedCalendar = selectMarketCalendar(now, body.calendarVersion as string | undefined, calendars.releases);
+		if (!selectedCalendar) return errorResponse('Calendar unavailable', 422);
+		const baseCalendar = selectedCalendar;
 		const twClose = env.TW_CLOSE ?? '13:30';
 		if (!isValidTwWindow({open: env.TW_OPEN ?? '09:00', close: twClose})) {
 			return errorResponse('Invalid TW trading session window', 400);
@@ -670,6 +679,17 @@ export default {
 		}> = [];
 		let twseSnapshot: TwEodSnapshot | null | undefined = undefined;
 		let tpexSnapshot: TwEodSnapshot | null | undefined = undefined;
+		const datedSnapshots = new Map<string, Promise<TwEodSnapshot[]>>();
+		const snapshotForDate = async (latest: TwEodSnapshot | null, board: 'TWSE' | 'TPEX', required?: string) => {
+			if (!required || latest?.tradingDate === required) return latest;
+			let pending = datedSnapshots.get(required);
+			if (!pending) {
+				pending = getArchivedTwEodSnapshots(env, required);
+				datedSnapshots.set(required, pending);
+			}
+			return (await pending).find(snapshot => board === 'TWSE'
+				? snapshot.source === 'TWSE_STOCK_DAY_ALL' : snapshot.source.startsWith('TPEX_')) ?? null;
+		};
 
 		const getTwseSnapshot = async () => {
 			if (twseSnapshot === undefined) {
@@ -692,14 +712,14 @@ export default {
 			targetTradingDate: string,
 			requireTradingDate?: string
 		): Promise<QuoteResult> => {
-			const twse = await getTwseSnapshot();
+			const twse = await snapshotForDate(await getTwseSnapshot(), 'TWSE', requireTradingDate);
 			const twseReady = !requireTradingDate || twse?.tradingDate === requireTradingDate;
 			const twseQuote = twseReady ? getTwEodQuote(twse, item.ticker) : null;
 			if (twse && twseReady && twseQuote && twseQuote.close !== null) {
 				return buildFromTwEod(item, twse, hitReason, hitStatus, targetTradingDate);
 			}
 
-			const tpex = await getTpexSnapshot();
+			const tpex = await snapshotForDate(await getTpexSnapshot(), 'TPEX', requireTradingDate);
 			const tpexReady = !requireTradingDate || tpex?.tradingDate === requireTradingDate;
 			const tpexQuote = tpexReady ? getTwEodQuote(tpex, item.ticker) : null;
 			if (tpex && tpexReady && tpexQuote && tpexQuote.close !== null) {
@@ -995,14 +1015,19 @@ export default {
 	async scheduled(event: ScheduledController, env: Env): Promise<void> {
 		try {
 			const now = new Date();
+			let calendars: Awaited<ReturnType<typeof loadCalendarCatalog>>;
+			try {calendars = await loadCalendarCatalog(env);}
+			catch {console.error('Calendar source unavailable',{archiveStatus:'calendar_source_error',scheduledTime:new Date(event.scheduledTime).toISOString()});return;}
 			console.log('TWSE/TPEX EOD scheduled triggered', {
 				cron: event.cron,
 				scheduledTime: new Date(event.scheduledTime).toISOString(),
 				now: now.toISOString()
 			});
-			const expectedDate = resolveMarketCloseContext('TW', now).expectedCloseTradingDate;
+			const selectedCalendar = selectMarketCalendar(now, undefined, calendars.releases);
+			const expectedDate = selectedCalendar ? resolveMarketCloseContext('TW', now, selectedCalendar).expectedCloseTradingDate : null;
 			if (!shouldRunTwEodRefresh(now) || !expectedDate) {
-				console.log('TWSE/TPEX EOD refresh skipped by local time window', { now: now.toISOString() });
+				console.log('TWSE/TPEX EOD refresh skipped', { now: now.toISOString(),
+					archiveStatus: expectedDate ? 'outside_collection_window' : 'calendar_unavailable',calendarRevision:calendars.catalog.revision });
 				return;
 			}
 
@@ -1035,7 +1060,7 @@ export default {
 				ok: !hasRefreshError(twseResult as RefreshResponse) || !hasRefreshError(tpexResult as RefreshResponse),
 				partial: hasRefreshError(twseResult as RefreshResponse) !== hasRefreshError(tpexResult as RefreshResponse)
 			});
-			const health = await eodHealth(env, now);
+			const health = await eodHealth(env, now, calendars.releases, calendars.catalog.revision);
 			if (!health.ok) console.error('Official EOD archive incomplete', await health.json());
 		} catch (error) {
 			console.error('TWSE/TPEX EOD refresh failed', error);

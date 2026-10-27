@@ -1,0 +1,37 @@
+name: Review official calendar notice
+on:
+  workflow_dispatch:
+    inputs:
+      official_url:
+        description: Exact TWSE or TPEX official PDF URL to review
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  candidate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Save source and unapproved candidate
+        env:
+          OFFICIAL_URL: ${{ inputs.official_url }}
+        run: node scripts/calendar-candidate.mjs --url "$OFFICIAL_URL" --output candidate
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: unapproved-calendar-notice
+          path: candidate/
+          retention-days: 30
+          if-no-files-found: error
+      - name: Explain review boundary
+        run: |
+          echo '## 人工確認交易日曆公告' >> "$GITHUB_STEP_SUMMARY"
+          echo '下載 artifact 核對交易所、日期、全日休市範圍及來源 PDF。個股停牌不代表交易所休市。候選尚未核准，本 workflow 不會發布日曆或修改歸檔。' >> "$GITHUB_STEP_SUMMARY"
+          echo '公告列表來源尚未驗證；此入口僅保存指定公告，不保證完整偵測所有公告。' >> "$GITHUB_STEP_SUMMARY"

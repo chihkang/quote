@@ -454,6 +454,8 @@ Legacy US KV entries without this metadata are refreshed once under the existing
 
 ## Downloadable market calendars and current CLI
 
+The proposed R2-backed calendar publication flow, approval contract, candidate workflow, initialization boundary and rollout restrictions are documented in [the calendar publication runbook](docs/market-calendar-publication.md). It requires separate deployment approval from the October 23 bundled-calendar fix.
+
 `GET /market-calendar` publishes schemaVersion 1, revision, and all immutable releases as `{effectiveFrom, sha256, document}`. `document` is the exact UTF-8 JSON string hashed by SHA256. The registry in `src/marketCalendar.ts` is also the source used for quotes, scheduled collection, EOD health, and session/TTL decisions. Revision `202602` retains `twse-nyse-2026-v1` unchanged and appends `twse-nyse-2026-v2`, effective at Taipei midnight on 2026-10-23. The correction adds the October 23 typhoon closure, keeps the existing October 26 holiday, and leaves US rules unchanged. The expected Taiwan completed session is October 22 through October 26 and during October 27 pre-open/trading; after the October 27 close, that day's own close is required. Sources: [TWSE closure announcement](https://eshop.twse.com.tw/zh/) and [Cathay Securities notice dated October 22](https://www.cathaysec.com.tw/cathaysec/News/nContent.aspx?CSeqNO=E9832133&NewsDate=20261022).
 
 Both quote routes accept optional `calendarVersion`. Unknown/uncovered versions return 422 before upstream work; malformed versions return 400. Existing clients may omit the field. Historical lookups select by their valuation reference date. The current catalog needs no authentication and has five-minute public HTTP caching.

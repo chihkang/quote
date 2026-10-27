@@ -1,0 +1,75 @@
+name: Set or revoke a market closure
+on:
+  workflow_dispatch:
+    inputs:
+      market:
+        description: Market local date belongs to
+        required: true
+        type: choice
+        options: [TW, US]
+      date:
+        description: Exact market local date (YYYY-MM-DD)
+        required: true
+        type: string
+      action:
+        description: Set closure or revoke a manually added closure
+        required: true
+        type: choice
+        options: [close, reopen]
+      reason:
+        description: Reason saved with the correction
+        required: true
+        type: string
+      publish:
+        description: Publish after reviewing the date and market (false previews only)
+        required: true
+        default: false
+        type: boolean
+permissions:
+  contents: read
+concurrency:
+  group: market-calendar-publication
+  cancel-in-progress: false
+env:
+  QUOTE_WORKER_URL: ${{ vars.QUOTE_WORKER_URL }}
+  CALENDAR_MARKET: ${{ inputs.market }}
+  CALENDAR_DATE: ${{ inputs.date }}
+  CALENDAR_ACTION: ${{ inputs.action }}
+  CALENDAR_REASON: ${{ inputs.reason }}
+jobs:
+  preview:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    outputs:
+      revision: ${{ steps.preview.outputs.revision }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - id: preview
+        run: node scripts/manage-market-calendar.mjs
+  publish:
+    if: inputs.publish && github.ref == 'refs/heads/main'
+    needs: preview
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    # Proposed new permission: requires owner approval before activation.
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Publish the reviewed date through restricted OIDC
+        env:
+          CALENDAR_EXPECTED_REVISION: ${{ needs.preview.outputs.revision }}
+        run: node scripts/manage-market-calendar.mjs --publish
