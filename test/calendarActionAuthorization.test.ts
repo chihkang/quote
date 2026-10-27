@@ -1,3 +1,7 @@
+import {Miniflare,convertV4MiniflareOptions} from 'miniflare';
+import ts from 'typescript';
+// @ts-expect-error Node-only fixture loader; application types target Cloudflare Workers.
+import {readFileSync} from 'node:fs';
 import { afterEach, beforeAll, expect, it, vi } from 'vitest';
 import { authorizeCalendarAction } from '../src/calendarActionAuthorization';
 import worker from '../src/index';
@@ -25,7 +29,7 @@ async function token(overrides:Record<string,unknown>={}) {
 async function authorize(overrides:Record<string,unknown>={},configured=true) {
   const fetchImpl=vi.fn(async(input:RequestInfo|URL,options?:RequestInit)=>{
     expect(String(input)).toBe('https://token.actions.githubusercontent.com/.well-known/jwks');
-    expect(options?.headers).toBeUndefined();
+    expect(options?.headers).toBeUndefined();expect(options?.redirect).toBe('manual');
     return Response.json({keys:[{...jwk,kid:'fixture',alg:'RS256',use:'sig'}]});
   });vi.stubGlobal('fetch',fetchImpl);
   const result=await authorizeCalendarAction(new Request(audience,{method:'POST',headers:{Authorization:'Bearer '+await token(overrides)}}),
@@ -83,4 +87,26 @@ it('reports only a rejection stage without logging the token or claim contents',
     expect(spy).toHaveBeenCalledWith('calendar_action_auth_rejected',{reason:'actor'});
     expect(JSON.stringify(spy.mock.calls)).not.toContain('private-fixture');
   } finally {spy.mockRestore();}
+});
+
+it('verifies a signed token in the actual Worker runtime rather than only Node',async()=>{
+  const source=readFileSync(new URL('../src/calendarActionAuthorization.ts',import.meta.url),'utf8');
+  const compiled=ts.transpileModule(source,{compilerOptions:{target:ts.ScriptTarget.ES2022,module:ts.ModuleKind.ESNext}}).outputText;
+  const keys={keys:[{...jwk,kid:'fixture',alg:'RS256',use:'sig'}]};
+  const mf=new Miniflare(convertV4MiniflareOptions({modules:true,compatibilityDate:'2025-03-07',compatibilityFlags:['nodejs_compat'],
+    bindings:{CALENDAR_GITHUB_AUDIENCE:audience},script:compiled+`
+    globalThis.fetch=async(input,init)=>{new Request(input,init);return Response.json(${JSON.stringify(keys)});};
+    export default {async fetch(request,env){return Response.json(await authorizeCalendarAction(request,env));}};`}));
+  try {
+    const response=await mf.dispatchFetch(audience,{headers:{Authorization:'Bearer '+await token()}});
+    expect(await response.json()).toEqual({actor:'chihkang',runId:'12345',runAttempt:'1'});
+  } finally {await mf.dispose();}
+});
+
+it('rejects a signing-key redirect without following it or sending authorization',async()=>{
+  const fetchImpl=vi.fn(async(_input:RequestInfo|URL,_options?:RequestInit)=>new Response(null,{status:302,headers:{Location:'https://other.test/keys'}}));
+  vi.stubGlobal('fetch',fetchImpl);
+  const result=await authorizeCalendarAction(new Request(audience,{headers:{Authorization:'Bearer '+await token()}}),{CALENDAR_GITHUB_AUDIENCE:audience});
+  expect(result).toBeNull();expect(fetchImpl).toHaveBeenCalledTimes(1);
+  expect(fetchImpl.mock.calls[0][0]).toBe('https://token.actions.githubusercontent.com/.well-known/jwks');
 });

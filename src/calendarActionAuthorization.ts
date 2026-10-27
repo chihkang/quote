@@ -31,7 +31,7 @@ export async function authorizeCalendarAction(request:Request,env:ActionTrust):P
     if(typeof claims.run_id!=='string' || !/^\d+$/.test(claims.run_id)
       || typeof claims.run_attempt!=='string' || !/^\d+$/.test(claims.run_attempt))return reject('run_identity');
     stage='key_fetch';
-    const response=await fetch('https://token.actions.githubusercontent.com/.well-known/jwks',{redirect:'error',signal:AbortSignal.timeout(10000)});
+    const response=await fetch('https://token.actions.githubusercontent.com/.well-known/jwks',{redirect:'manual',signal:AbortSignal.timeout(10000)});
     if(!response.ok)return reject('key_source_status');
     stage='key_read';
     const reader=response.body?.getReader();if(!reader)return reject('key_source_empty');
