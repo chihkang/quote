@@ -137,6 +137,29 @@ describe('TW EOD fallback behavior', () => {
       calendarVersion: 'twse-nyse-2026-v1' });
     expect(fetchSpy).not.toHaveBeenCalled();
   });
+  it.each(['2026-10-23', '2026-10-24', '2026-10-25', '2026-10-26'])(
+    'serves the actual October 22 official close on %s without a holiday provider fetch', async day => {
+      vi.setSystemTime(new Date(`${day}T06:00:00Z`));
+      const kv = createKv();
+      const r2 = createR2({ [TWSE_EOD_LATEST_KEY]: JSON.stringify(buildTwEodSnapshot({
+        tradingDate: '2026-10-22', fetchedAt: '2026-10-22T06:00:00Z'
+      })) });
+      const fetchMock = vi.fn();
+      vi.stubGlobal('fetch', fetchMock);
+      const response = await callTwBatch(makeEnv({kv, r2}), ['2330']);
+      const json = await response.json() as any;
+      expect(json.results[0]).toMatchObject({price: 1080, closeKind: 'official_eod',
+        sourceTradingDate: '2026-10-22', targetTradingDate: day,
+        expectedCloseTradingDate: '2026-10-22', marketSessionState: 'closed',
+        calendarVersion: 'twse-nyse-2026-v2'});
+      expect(fetchMock).not.toHaveBeenCalled();
+      // Reopening must not relabel this archive as the October 27 close.
+      vi.setSystemTime(new Date('2026-10-27T06:00:00Z'));
+      const reopened = await callTwBatch(makeEnv({kv, r2}), ['2330']);
+      const body = await reopened.json() as any;
+      expect(body.results[0]).toMatchObject({price: null, closeKind: 'unavailable',
+        expectedCloseTradingDate: '2026-10-27', marketSessionState: 'post_close'});
+    });
 	it('returns official EOD close after close even when quote cache has an earlier value', async () => {
 		vi.setSystemTime(new Date('2026-02-10T06:00:00.000Z')); // 14:00 Asia/Taipei
 		const kv = createKv({
