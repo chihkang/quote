@@ -12,6 +12,7 @@ export async function authorizeCalendarAction(request:Request,env:ActionTrust):P
   if (!audience || !audience.startsWith('https:') || audience!==request.url) return reject('configuration');
   const authorization=request.headers.get('authorization') ?? '';
   if (!authorization.startsWith('Bearer ') || authorization.length>16384) return reject('authorization');
+  let stage='token_parse';
   try {
     const parts=authorization.slice(7).split('.');
     if(parts.length!==3)return reject('format');
@@ -29,18 +30,23 @@ export async function authorizeCalendarAction(request:Request,env:ActionTrust):P
       )return reject('token_time');
     if(typeof claims.run_id!=='string' || !/^\d+$/.test(claims.run_id)
       || typeof claims.run_attempt!=='string' || !/^\d+$/.test(claims.run_attempt))return reject('run_identity');
+    stage='key_fetch';
     const response=await fetch('https://token.actions.githubusercontent.com/.well-known/jwks',{redirect:'error',signal:AbortSignal.timeout(10000)});
     if(!response.ok)return reject('key_source_status');
+    stage='key_read';
     const reader=response.body?.getReader();if(!reader)return reject('key_source_empty');
     const chunks:Uint8Array[]=[];let size=0;
     for(;;){const {done,value}=await reader.read();if(done)break;size+=value.byteLength;if(size>65536){await reader.cancel();return reject('key_source_size');}chunks.push(value);}
     const bytes=new Uint8Array(size);let offset=0;for(const chunk of chunks){bytes.set(chunk,offset);offset+=chunk.byteLength;}
+    stage='key_parse';
     const jwks:unknown=JSON.parse(new TextDecoder().decode(bytes));
     if(!object(jwks) || !Array.isArray(jwks.keys) || jwks.keys.length>20)return reject('key_source_format');
     const key=jwks.keys.find(value=>object(value) && value.kid===header.kid);
     if(!object(key) || key.kty!=='RSA' || key.alg!=='RS256' || key.use!=='sig' || typeof key.n!=='string' || typeof key.e!=='string')return reject('key_selection');
+    stage='key_import';
     const imported=await crypto.subtle.importKey('jwk',{kty:'RSA',n:key.n,e:key.e,alg:'RS256',ext:true},{name:'RSASSA-PKCS1-v1_5',hash:'SHA-256'},false,['verify']);
+    stage='signature_verify';
     const valid=await crypto.subtle.verify('RSASSA-PKCS1-v1_5',imported,decode(parts[2]),new TextEncoder().encode(parts[0]+'.'+parts[1]));
     return valid ? {actor:claims.actor,runId:claims.run_id,runAttempt:claims.run_attempt} : reject('signature');
-  } catch {return reject('verification_exception');}
+  } catch {return reject(stage+'_exception');}
 }
