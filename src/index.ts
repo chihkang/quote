@@ -1,5 +1,5 @@
 import { calendarPublication } from './calendarPublication';
-import { loadCalendarCatalog, publishCalendar, calendarSourceError } from './calendarCatalog';
+import { loadCalendarCatalog, publishCalendar, publishManualClosure, calendarBootstrap, calendarSourceError } from './calendarCatalog';
 import { selectMarketCalendar, resolveMarketCloseContext, isValidTwWindow } from './marketCalendar';
 import { l1Get, l1Set } from './l1Cache';
 import { getQuote, putQuote, type QuoteCacheValue } from './kvCache';
@@ -33,6 +33,7 @@ export type Env = {
 	TW_EOD_R2?: R2Bucket;
 	ADMIN_REFRESH_TOKEN?: string;
 	CALENDAR_STORAGE_REQUIRED?: string;
+	CALENDAR_GITHUB_AUDIENCE?: string;
 	DEFAULT_MARKET?: string;
 	MAX_SYNC_FETCH?: string;
 	MAX_SYMBOLS_PER_REQUEST?: string;
@@ -550,6 +551,8 @@ export default {
 
 		const pathname = new URL(request.url).pathname;
 		if (pathname === '/admin/market-calendar/publish') return publishCalendar(request, env);
+		if (pathname === '/admin/market-calendar/closures') return publishManualClosure(request, env);
+		if (pathname === '/market-calendar/bootstrap' && request.method === 'GET') return calendarBootstrap(env);
 		let calendars: Awaited<ReturnType<typeof loadCalendarCatalog>>;
 		try { calendars = await loadCalendarCatalog(env); }
 		catch { return calendarSourceError(); }
@@ -676,6 +679,17 @@ export default {
 		}> = [];
 		let twseSnapshot: TwEodSnapshot | null | undefined = undefined;
 		let tpexSnapshot: TwEodSnapshot | null | undefined = undefined;
+		const datedSnapshots = new Map<string, Promise<TwEodSnapshot[]>>();
+		const snapshotForDate = async (latest: TwEodSnapshot | null, board: 'TWSE' | 'TPEX', required?: string) => {
+			if (!required || latest?.tradingDate === required) return latest;
+			let pending = datedSnapshots.get(required);
+			if (!pending) {
+				pending = getArchivedTwEodSnapshots(env, required);
+				datedSnapshots.set(required, pending);
+			}
+			return (await pending).find(snapshot => board === 'TWSE'
+				? snapshot.source === 'TWSE_STOCK_DAY_ALL' : snapshot.source.startsWith('TPEX_')) ?? null;
+		};
 
 		const getTwseSnapshot = async () => {
 			if (twseSnapshot === undefined) {
@@ -698,14 +712,14 @@ export default {
 			targetTradingDate: string,
 			requireTradingDate?: string
 		): Promise<QuoteResult> => {
-			const twse = await getTwseSnapshot();
+			const twse = await snapshotForDate(await getTwseSnapshot(), 'TWSE', requireTradingDate);
 			const twseReady = !requireTradingDate || twse?.tradingDate === requireTradingDate;
 			const twseQuote = twseReady ? getTwEodQuote(twse, item.ticker) : null;
 			if (twse && twseReady && twseQuote && twseQuote.close !== null) {
 				return buildFromTwEod(item, twse, hitReason, hitStatus, targetTradingDate);
 			}
 
-			const tpex = await getTpexSnapshot();
+			const tpex = await snapshotForDate(await getTpexSnapshot(), 'TPEX', requireTradingDate);
 			const tpexReady = !requireTradingDate || tpex?.tradingDate === requireTradingDate;
 			const tpexQuote = tpexReady ? getTwEodQuote(tpex, item.ticker) : null;
 			if (tpex && tpexReady && tpexQuote && tpexQuote.close !== null) {

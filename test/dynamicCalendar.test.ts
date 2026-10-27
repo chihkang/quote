@@ -1,10 +1,12 @@
 import { afterEach, expect, it, vi } from 'vitest';
 import worker from '../src/index';
 import { calendarPublication } from '../src/calendarPublication';
-import { bundledCatalog, sha256 } from '../src/calendarCatalog';
+import { bundledCatalog, sha256, parseCatalog } from '../src/calendarCatalog';
+import { resolveMarketCloseContext, selectMarketCalendar } from '../src/marketCalendar';
 import { clearTwEodL1Cache } from '../src/twEod';
+import {l1Clear} from '../src/l1Cache';
 
-afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); clearTwEodL1Cache(); });
+afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); clearTwEodL1Cache();l1Clear(); });
 const key = 'market-calendar/catalog.json';
 async function fixture() {
   const baseline = await bundledCatalog();
@@ -193,4 +195,140 @@ it.each(['unsorted','weekend','lateClose','missingSources','longVersion','longDo
   entry.document=JSON.stringify(data);entry.sha256=await sha256(entry.document);
   expect((await f.publish()).status).toBe(400);
   expect(f.objects.size).toBe(0);
+});
+
+async function manualClosure(f:Awaited<ReturnType<typeof fixture>>,market:string,day:string,revision=202602,action='close') {
+  return worker.fetch(new Request('https://fixture.test/admin/market-calendar/closures',{method:'POST',headers:{Authorization:'Bearer admin-fixture'},
+    body:JSON.stringify({market,date:day,action,expectedRevision:revision,approvedBy:'fixture-operator',reason:'Manual exchange-wide closure'})}),f.env);
+}
+
+it.each(['TW','US'])('manually closes one %s date while preserving the other market and subsequent trading days',async market=>{
+  vi.useFakeTimers();vi.setSystemTime(new Date('2026-10-27T22:00:00Z'));
+  const f=await fixture();
+  const response=await manualClosure(f,market,'2026-10-27');
+  expect(response.status).toBe(200);
+  const catalog=await (await worker.fetch(new Request('https://fixture.test/market-calendar'),f.env)).json();
+  const {releases}=await parseCatalog(catalog);
+  const selected=selectMarketCalendar(new Date('2026-10-27T22:00:00Z'),undefined,releases)!;
+  expect(resolveMarketCloseContext('TW',new Date('2026-10-27T22:00:00Z'),selected).expectedCloseTradingDate).toBe(market==='TW'?'2026-10-22':'2026-10-27');
+  expect(resolveMarketCloseContext('US',new Date('2026-10-27T22:00:00Z'),selected).expectedCloseTradingDate).toBe(market==='US'?'2026-10-26':'2026-10-27');
+  const later=selectMarketCalendar(new Date('2026-10-28T22:00:00Z'),undefined,releases)!;
+  expect(resolveMarketCloseContext(market==='TW'?'TW':'US',new Date('2026-10-28T22:00:00Z'),later).expectedCloseTradingDate).toBe('2026-10-28');
+  expect(JSON.parse(f.objects.get(key)!).audit[0]).toMatchObject({basis:'manual_override',evidenceURLs:[]});
+});
+
+it('does not report a manually closed day complete when its previous official archive is missing',async()=>{
+  vi.useFakeTimers();vi.setSystemTime(new Date('2026-10-27T06:00:00Z'));
+  const f=await fixture();expect((await manualClosure(f,'TW','2026-10-27')).status).toBe(200);
+  const health=await worker.fetch(new Request('https://fixture.test/health/eod'),f.env);
+  expect(health.status).toBe(503);
+  expect(await health.json()).toMatchObject({expectedTradingDate:'2026-10-22',marketStatus:'confirmed_closed',archiveStatus:'awaiting_publication',complete:false});
+});
+
+it('keeps future manual closures inactive until effectiveFrom and makes repeated approval idempotent',async()=>{
+  vi.useFakeTimers();vi.setSystemTime(new Date('2026-10-27T06:00:00Z'));
+  const f=await fixture();expect((await manualClosure(f,'US','2026-10-29')).status).toBe(200);
+  const health=await worker.fetch(new Request('https://fixture.test/health/eod'),f.env);
+  expect(await health.json()).toMatchObject({calendarVersion:'twse-nyse-2026-v2',expectedTradingDate:'2026-10-27'});
+  expect((await manualClosure(f,'US','2026-10-29',202603)).status).toBe(200);
+  expect(JSON.parse(f.objects.get(key)!).audit).toHaveLength(1);
+});
+
+it('rejects invalid markets, invalid dates and stale manual revisions',async()=>{
+  const f=await fixture();
+  expect((await manualClosure(f,'STOCK','2026-10-27')).status).toBe(400);
+  expect((await manualClosure(f,'TW','2026-02-30')).status).toBe(400);
+  expect((await manualClosure(f,'TW','2026-10-27',1)).status).toBe(409);
+  expect(f.objects.size).toBe(0);
+});
+
+it('revokes only a manually added closure and keeps the official holiday baseline immutable',async()=>{
+  const f=await fixture();
+  expect((await manualClosure(f,'TW','2026-10-23',202602,'reopen')).status).toBe(409);
+  expect((await manualClosure(f,'TW','2026-10-27')).status).toBe(200);
+  expect((await manualClosure(f,'TW','2026-10-27',202603,'reopen')).status).toBe(200);
+  const record=JSON.parse(f.objects.get(key)!);
+  expect(record.audit).toHaveLength(2);
+  const {releases}=await parseCatalog(record.catalog);
+  const selected=selectMarketCalendar(new Date('2026-10-27T22:00:00Z'),undefined,releases)!;
+  expect(selected.TW.holidays).not.toContain('2026-10-27');
+  expect(selected.TW.holidays).toContain('2026-10-23');
+  expect(resolveMarketCloseContext('TW',new Date('2026-10-27T22:00:00Z'),selected).expectedCloseTradingDate).toBe('2026-10-27');
+  expect(record.catalog.calendars.slice(0,2)).toEqual(f.baseline.calendars);
+});
+
+it('preserves other future corrections when an earlier manual closure is added and revoked',async()=>{
+  const f=await fixture();
+  expect((await manualClosure(f,'US','2026-10-29')).status).toBe(200);
+  expect((await manualClosure(f,'TW','2026-10-27',202603)).status).toBe(200);
+  const middle=await parseCatalog(JSON.parse(f.objects.get(key)!).catalog);
+  expect(selectMarketCalendar(new Date('2026-10-29T22:00:00Z'),undefined,middle.releases)!.TW.holidays).toContain('2026-10-27');
+  expect((await manualClosure(f,'TW','2026-10-27',202604,'reopen')).status).toBe(200);
+  const {releases}=await parseCatalog(JSON.parse(f.objects.get(key)!).catalog);
+  const selected=selectMarketCalendar(new Date('2026-10-29T22:00:00Z'),undefined,releases)!;
+  expect(selected.TW.holidays).not.toContain('2026-10-27');
+  expect(selected.US.holidays).toContain('2026-10-29');
+});
+
+it('restores an existing US early close when its manually added closure is revoked',async()=>{
+  const f=await fixture();
+  expect((await manualClosure(f,'US','2026-11-27')).status).toBe(200);
+  expect((await manualClosure(f,'US','2026-11-27',202603,'reopen')).status).toBe(200);
+  const {releases}=await parseCatalog(JSON.parse(f.objects.get(key)!).catalog);
+  expect(selectMarketCalendar(new Date('2026-11-27T22:00:00Z'),undefined,releases)!.US.earlyCloses['2026-11-27']).toBe('13:00');
+});
+
+it('allows an authenticated first Action operation to seed the bundle, but never bootstrap lost history',async()=>{
+  const f=await fixture();const env={...f.env,CALENDAR_STORAGE_REQUIRED:'true'};
+  const bootstrap=()=>worker.fetch(new Request('https://fixture.test/market-calendar/bootstrap'),env);
+  expect((await bootstrap()).status).toBe(200);
+  const request=new Request('https://fixture.test/admin/market-calendar/closures',{method:'POST',headers:{Authorization:'Bearer admin-fixture'},
+    body:JSON.stringify({market:'TW',date:'2026-10-23',action:'close',reason:'Approved initial calendar',approvedBy:'fixture',expectedRevision:202602})});
+  expect((await worker.fetch(request,env)).status).toBe(200);
+  expect((await worker.fetch(new Request('https://fixture.test/market-calendar'),env)).status).toBe(200);
+  expect((await bootstrap()).status).toBe(409);
+  f.objects.delete(key);
+  expect((await bootstrap()).status).toBe(503);
+});
+
+it('uses the previous dated TW archive even when a newer latest snapshot exists',async()=>{
+  vi.useFakeTimers();vi.setSystemTime(new Date('2026-10-27T06:00:00Z'));
+  const f=await fixture();await manualClosure(f,'TW','2026-10-27');
+  const snapshot=(day:string,close:number)=>({tradingDate:day,fetchedAt:day+'T06:00:00Z',source:'TWSE_STOCK_DAY_ALL',quotes:{'2330':{close,name:'fixture'}}});
+  f.objects.set('twse/eod/latest.json',JSON.stringify(snapshot('2026-10-27',200)));
+  f.objects.set('twse/eod/2026-10-22.json',JSON.stringify(snapshot('2026-10-22',100)));
+  const response=await worker.fetch(new Request('https://fixture.test/quotes/batch',{method:'POST',body:'{"market":"TW","symbols":["2330"]}'}),f.env);
+  expect(await response.json()).toMatchObject({results:[{price:100,closeKind:'official_eod',sourceTradingDate:'2026-10-22',targetTradingDate:'2026-10-27',expectedCloseTradingDate:'2026-10-22',marketSessionState:'closed'}]});
+});
+
+it('keeps the verified US provider close on its real preceding date without calling it Taiwan official EOD',async()=>{
+  vi.useFakeTimers();vi.setSystemTime(new Date('2026-10-27T22:00:00Z'));
+  const f=await fixture();await manualClosure(f,'US','2026-10-27');
+  const env={...f.env,FINNHUB_API_KEY:'fixture',QUOTES_KV:{get:async()=>null,put:async()=>{}} as unknown as KVNamespace};
+  vi.stubGlobal('fetch',async()=>Response.json({c:100,t:Date.parse('2026-10-26T20:00:00Z')/1000}));
+  const response=await worker.fetch(new Request('https://fixture.test/quotes/batch',{method:'POST',body:'{"market":"US","symbols":["AAPL"]}'}),env);
+  expect(await response.json()).toMatchObject({results:[{price:100,closeKind:'intraday',sourceTradingDate:'2026-10-26',expectedCloseTradingDate:'2026-10-26',marketSessionState:'closed',sourceTimestampVerified:true}]});
+});
+
+it('keeps a future official closure when revoking an earlier manual override of the same date',async()=>{
+  const f=await fixture();
+  f.catalog.calendars.at(-1)!.effectiveFrom='2026-10-28';
+  expect((await f.publish()).status).toBe(200);
+  expect((await manualClosure(f,'TW','2026-10-27',202603)).status).toBe(200);
+  expect((await manualClosure(f,'TW','2026-10-27',202604,'reopen')).status).toBe(200);
+  const {releases}=await parseCatalog(JSON.parse(f.objects.get(key)!).catalog);
+  expect(selectMarketCalendar(new Date('2026-10-27T12:00:00Z'),undefined,releases)!.TW.holidays).not.toContain('2026-10-27');
+  expect(selectMarketCalendar(new Date('2026-10-28T22:00:00Z'),undefined,releases)!.TW.holidays).toContain('2026-10-27');
+});
+
+it('preserves a clean official future release published after the manual closure',async()=>{
+  const f=await fixture();
+  expect((await manualClosure(f,'TW','2026-10-27')).status).toBe(200);
+  const current=JSON.parse(f.objects.get(key)!).catalog;
+  const official={...f.catalog.calendars.at(-1)!,effectiveFrom:'2026-10-28'};
+  expect((await f.publish({...f.payload,expectedRevision:202603,catalog:{...current,revision:202604,calendars:[...current.calendars,official]}})).status).toBe(200);
+  expect((await manualClosure(f,'TW','2026-10-27',202604,'reopen')).status).toBe(200);
+  const {releases}=await parseCatalog(JSON.parse(f.objects.get(key)!).catalog);
+  expect(selectMarketCalendar(new Date('2026-10-27T12:00:00Z'),undefined,releases)!.TW.holidays).not.toContain('2026-10-27');
+  expect(selectMarketCalendar(new Date('2026-10-28T12:00:00Z'),undefined,releases)!.TW.holidays).toContain('2026-10-27');
 });

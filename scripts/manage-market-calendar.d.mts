@@ -1,0 +1,2 @@
+export function previewClosure(catalog:unknown,market:string,date:string,action:string):{market:string;date:string;action:string;revision:number;expectedTradingDate:string};
+export function manageCalendar(options:{workerURL:string;market:string;date:string;action:string;reason:string;publish?:boolean;expectedRevision?:number;fetchImpl?:typeof fetch;getToken?:(audience:string)=>Promise<string>}):Promise<{published:boolean;revision:number;expectedTradingDate:string;archive?:{complete:boolean;status:string}}>;
