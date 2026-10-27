@@ -12,6 +12,21 @@ function archiveHealth(tpex = false, twse = false) {
 const healthResponse = (tpex = false, twse = false) =>
 	Response.json(archiveHealth(tpex, twse), { status: tpex && twse ? 200 : 503 });
 
+it('reports board/date/calendar diagnostics on final failure without credentials', async () => {
+	const fetchImpl = async () => healthResponse(true, false);
+	const promise = collectTpex({workerURL:'https://archive.invalid',token:'private-fixture-token',requireComplete:true,fetchImpl});
+	await expect(promise).rejects.toThrow('expectedTradingDate');
+	await expect(promise).rejects.toThrow('2026-09-30');
+	await expect(promise).rejects.toThrow('TWSE');
+	await expect(promise).rejects.not.toThrow('private-fixture-token');
+});
+
+it('reports incomplete polling separately from successful archive completion', async () => {
+	const fetchImpl = async () => healthResponse(true, false);
+	expect(await collectTpex({workerURL:'https://archive.invalid',token:'fixture',fetchImpl}))
+		.toMatchObject({alreadyArchived:true,archiveComplete:false,calendarVersion:'twse-nyse-2026-v1',expectedTradingDate:'2026-09-30'});
+});
+
 // Existing download/ingest scenarios start with no archived close.
 function withMissingHealth(fetchImpl: (...args: any[]) => any) {
 	return (url: URL | string, options: any) => String(url).endsWith('/health/eod')

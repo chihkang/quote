@@ -18,6 +18,7 @@ export default defineConfig({
 			}),
 		],
 		env: {
+			CALENDAR_STORAGE_REQUIRED: bindings.text("true"),
 			DEFAULT_MARKET: bindings.text("TW"),
 			MAX_SYNC_FETCH: bindings.text("10"),
 			MAX_SYMBOLS_PER_REQUEST: bindings.text("10"),

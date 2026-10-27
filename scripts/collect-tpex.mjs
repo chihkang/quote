@@ -42,8 +42,20 @@ function hasArchivedBoard(health, board) {
 function requireCompleteArchive(health) {
 	if (!health?.ok || health.body?.complete !== true
 		|| !hasArchivedBoard(health, 'TWSE') || !hasArchivedBoard(health, 'TPEX')) {
-		throw new Error('Official archive incomplete after final daily attempt');
+		throw new Error('Official archive incomplete after final daily attempt: ' + JSON.stringify(archiveDiagnostics(health)));
 	}
+}
+
+function archiveDiagnostics(health) {
+	const complete = !!health?.ok && health.body?.complete === true && hasArchivedBoard(health,'TWSE') && hasArchivedBoard(health,'TPEX');
+	return {archiveComplete:complete,expectedTradingDate:health?.body?.expectedTradingDate ?? null,
+		calendarVersion:health?.body?.calendarVersion ?? null,calendarRevision:health?.body?.calendarRevision ?? null,
+		marketStatus:health?.body?.marketStatus ?? 'unknown',
+		archiveStatus:health?.body?.archiveStatus ?? (health ? complete ? 'complete' : 'awaiting_publication' : 'source_error'),
+		boards:Object.fromEntries(['TWSE','TPEX'].map(board=>[board,{
+			available:hasArchivedBoard(health,board),sourceTradingDate:health?.body?.boards?.[board]?.sourceTradingDate ?? null,
+			quoteCount:health?.body?.boards?.[board]?.quoteCount ?? 0
+		}]))};
 }
 
 // Runs on an independent server/runner when the official API rejects Workers' egress.
@@ -58,6 +70,7 @@ export async function collectTpex({ workerURL, token, requireComplete = false, f
 			requireCompleteArchive(health);
 		}
 		return { alreadyArchived: true, awaitingPublication: false,
+			...archiveDiagnostics(health),
 			tradingDate: health.body.expectedTradingDate, quoteCount: health.body.boards.TPEX.quoteCount,
 			...(downloadWarning ? { downloadWarning } : {}) };
 	};
@@ -100,10 +113,9 @@ export async function collectTpex({ workerURL, token, requireComplete = false, f
 	const result = await ingest.json();
 	const awaitingPublication = ingest.status === 409 && result.error === 'Source date does not match expected completed session';
 	if (!ingest.ok && !awaitingPublication) throw new Error('Archive ingestion failed: HTTP ' + ingest.status);
-	if (requireComplete) {
-		requireCompleteArchive(await readArchiveHealth(workerURL, fetchImpl));
-	}
-	return { awaitingPublication, tradingDate: result.tradingDate ?? null, quoteCount: result.quoteCount ?? 0, downloadMethod };
+	const finalHealth = await readArchiveHealth(workerURL, fetchImpl);
+	if (requireComplete) requireCompleteArchive(finalHealth);
+	return { awaitingPublication, ...archiveDiagnostics(finalHealth), tradingDate: result.tradingDate ?? null, quoteCount: result.quoteCount ?? 0, downloadMethod };
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
