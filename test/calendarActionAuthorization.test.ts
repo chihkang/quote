@@ -75,3 +75,12 @@ it('publishes and revokes through the real workflow client and Worker while miss
   expect(await manageCalendar({workerURL:'https://quote.test',market:'TW',date:'2026-10-27',action:'reopen',reason:'revoke manual closure',publish:true,
     expectedRevision:202603,fetchImpl,getToken:async()=>token()})).toMatchObject({published:true,revision:202604,expectedTradingDate:'2026-10-27'});
 });
+
+it('reports only a rejection stage without logging the token or claim contents',async()=>{
+  const spy=vi.spyOn(console,'warn').mockImplementation(()=>{});
+  try {
+    expect((await authorize({actor_id:'private-fixture'})).result).toBeNull();
+    expect(spy).toHaveBeenCalledWith('calendar_action_auth_rejected',{reason:'actor'});
+    expect(JSON.stringify(spy.mock.calls)).not.toContain('private-fixture');
+  } finally {spy.mockRestore();}
+});
