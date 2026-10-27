@@ -19,6 +19,7 @@ export default defineConfig({
 		],
 		env: {
 			CALENDAR_STORAGE_REQUIRED: bindings.text("true"),
+			CALENDAR_GITHUB_AUDIENCE: bindings.text("https://quote-worker.4qcq8mc7f8.workers.dev/admin/market-calendar/closures"),
 			DEFAULT_MARKET: bindings.text("TW"),
 			MAX_SYNC_FETCH: bindings.text("10"),
 			MAX_SYMBOLS_PER_REQUEST: bindings.text("10"),

@@ -1,6 +1,6 @@
 # 人工發布交易日曆
 
-本架構是待審草稿。合併、部署、初始化正式 R2 均需另行確認。10/23 舊修復的發布授權不涵蓋本架構。
+本架構的整合、部署與既有日曆初始化已取得授權；限定的 GitHub OIDC 信任亦已另行核准。正式上線狀態仍須以部署、workflow log 與日曆讀回確認。
 
 ## 資料與權限
 
@@ -14,20 +14,20 @@
 
 close 僅影響該市場的指定日期；reopen 只撤銷人工加入的休市，不能刪除年度官方休市。重複 close 不追加紀錄；撤銷後再次撤銷會明確拒絕。新版本也更新已排定的未來 snapshot，避免到未來生效日又恢復錯誤規則；保留所有舊 document 與 audit。半日交易被人工改為全日休市後，撤銷會還原原先收盤時間。
 
-workflow 發布使用**尚待核准的 OIDC 信任**，不複製現有完整管理 token 到 GitHub，不建立手機或長效 secret。GitHub 可為具 `id-token: write` 的 job 簽發短效身分 token；本 Worker 再限縮可執行的操作（[GitHub OIDC 契約](https://docs.github.com/en/actions/reference/security/oidc)）。核准需求一次列明：
+workflow 發布使用**另行核准的 OIDC 信任**，不複製現有完整管理 token 到 GitHub，不建立手機或長效 secret。GitHub 可為具 `id-token: write` 的 job 簽發短效身分 token；本 Worker 再限縮可執行的操作（[GitHub OIDC 契約](https://docs.github.com/en/actions/reference/security/oidc)）。核准需求一次列明：
 
 - 僅 publish job 新增 `id-token: write`；preview 維持 `contents: read`。
-- Worker 新增非秘密設定 `CALENDAR_GITHUB_AUDIENCE`，值為正式 origin 的 `/admin/market-calendar/closures` 完整 HTTPS URL。未設定即拒絕所有 OIDC 發布，目前沒有啟用。
+- Worker 新增非秘密設定 `CALENDAR_GITHUB_AUDIENCE`，值為正式 origin 的 `/admin/market-calendar/closures` 完整 HTTPS URL。未設定即拒絕所有 OIDC 發布。
 - 驗證 GitHub 簽章、issuer、exact audience、repo `chihkang/quote`／ID `1142362573`、owner ID `8790142`、actor `chihkang`／ID `8790142`、main、指定 workflow_ref 及 workflow_dispatch。有效期最多十分鐘。
 - 權限只設定／撤銷 TW／US 日期，不能呼叫完整 catalog 發布、行情 refresh 或 ingest。audit 的核准者取已簽章 actor/run/attempt，不能由 body 冒充。
 - token 僅存在執行中的 job 與 request 記憶體；不寫入檔案、artifact、App、聊天或 log。Worker 透過 GitHub 固定 JWKS URL 驗簽，不儲存金鑰。
 - 撤銷方式是移除 Worker audience 設定，立即拒絕後續請求；亦可停用 workflow／移除 job 權限。沒有待交付或輪替的長效憑證。
 
-此權限、架構提交／合併／部署與正式 R2 初始化均未執行，需各自取得確認。現有 `ADMIN_REFRESH_TOKEN` 保留原有完整管理能力，但 workflow 不持有或讀取它。全域年度 catalog 發布仍由現有完整管理入口處理。
+此權限與架構整合／部署／既有日曆初始化已分別獲准；不得擴張 actor、repo、branch、workflow 或管理操作。現有 `ADMIN_REFRESH_TOKEN` 保留原有完整管理能力，但 workflow 不持有或讀取它。全域年度 catalog 發布仍由現有完整管理入口處理。
 
 ## 正式啟用順序
 
-1. 確認本架構部署及初始化授權，保留部署前版本。部署設定 `CALENDAR_STORAGE_REQUIRED=true`。此模式在初始化前明確回 503，不能誤用 bundled 舊規則。這段切換需要安排維護時間。
+1. 確認本架構部署及初始化授權，保留部署前版本。部署設定 `CALENDAR_STORAGE_REQUIRED=true`。此模式在初始化前明確回 503，不能誤用 bundled 舊規則。首次啟用可先以同一版本、暫時 CALENDAR_STORAGE_REQUIRED=false 供應已驗證 bundled 日曆，經 workflow 初始化並讀回後立即切換 true，以縮短不可用窗口；初始化標記存在但 catalog 遺失時，兩種設定都 fail closed。
 2. 人工核對 bundled catalog。首次可由既有完整發布入口初始化相同目錄，或由已核准的手動休市 workflow 完成首次發布。只讀 `/market-calendar/bootstrap` 僅在 catalog 與初始化標記從未建立時提供 bundled preview；已有歷史或標記時拒絕 bootstrap。正式儲存缺失、讀取失敗或內容不合法時，health、報價與 catalog 都 fail closed。
 3. 之後新增更正只需發布新的 document/version/revision，不需重新部署。發布仍要求人工核准，不從缺價或下載失敗推論休市。
 4. 讀回 `/market-calendar`，確認所有 digest 與 revision。查 `/health/eod` 的版本、預期日、兩板正價格數，並查實際 TWSE/TPEX 股票的來源日期。修正日曆和實際歸檔完整是不同驗收項目。
